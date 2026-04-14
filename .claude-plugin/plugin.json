@@ -1,0 +1,63 @@
+{
+  "name": "claude-memory-pro",
+  "version": "1.0.0",
+  "description": "语义记忆增强 - 基于 LanceDB 向量数据库 + 混合检索的长期记忆系统，替代 Claude Code 原生文本记忆",
+  "mcpServers": {
+    "claude-memory-pro": {
+      "command": "node",
+      "args": ["${pluginDir}/../dist/mcp-server.js"],
+      "env": {
+        "MEMORY_DB_PATH": "${userHome}/.claude/memory-pro/lancedb",
+        "EMBEDDING_API_KEY": "",
+        "EMBEDDING_BASE_URL": "https://api.siliconflow.cn/v1",
+        "EMBEDDING_MODEL": "BAAI/bge-m3"
+      },
+      "userConfig": {
+        "EMBEDDING_API_KEY": {
+          "description": "嵌入模型 API Key（支持 OpenAI 兼容接口）",
+          "required": true,
+          "sensitive": true
+        },
+        "EMBEDDING_BASE_URL": {
+          "description": "嵌入模型 API 地址（默认 SiliconFlow）",
+          "required": false,
+          "default": "https://api.siliconflow.cn/v1"
+        },
+        "EMBEDDING_MODEL": {
+          "description": "嵌入模型名称（默认 BAAI/bge-m3，1024维）",
+          "required": false,
+          "default": "BAAI/bge-m3"
+        },
+        "MEMORY_DB_PATH": {
+          "description": "LanceDB 数据库存储路径",
+          "required": false,
+          "default": "${userHome}/.claude/memory-pro/lancedb"
+        }
+      }
+    }
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"[claude-memory-pro] 语义记忆系统已就绪。使用 memory_recall 工具进行语义检索，memory_store 存储重要信息。\"}}'",
+            "statusMessage": "加载语义记忆..."
+          }
+        ]
+      }
+    ]
+  },
+  "skills": {
+    "memory-status": {
+      "description": "查看语义记忆系统状态、存储统计和检索配置",
+      "prompt": "调用 memory_stats 工具查看记忆系统的当前状态，包括总记忆数、各分类数量、检索模式等信息。"
+    }
+  },
+  "rules": [
+    "当用户提到"记住"、"记得"、"以后都"等关键词时，主动使用 memory_store 工具保存。",
+    "在回答问题前，如果问题涉及用户偏好、历史决策或项目上下文，先用 memory_recall 检索相关记忆。",
+    "存储记忆时根据内容选择合适的 category：preference（偏好）、fact（事实）、decision（决策）、entity（实体）。"
+  ]
+}

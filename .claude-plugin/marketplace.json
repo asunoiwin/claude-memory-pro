@@ -1,0 +1,16 @@
+{
+  "name": "claude-memory-pro",
+  "version": "1.0.0",
+  "description": "Claude Code 语义记忆增强插件 - 基于 LanceDB 向量数据库的混合检索长期记忆系统",
+  "owner": {
+    "name": "asunoiwin",
+    "url": "https://github.com/asunoiwin"
+  },
+  "plugins": [
+    {
+      "name": "claude-memory-pro",
+      "source": "./",
+      "description": "语义记忆增强：LanceDB 向量存储 + BM25 混合检索 + 时间衰减 + MMR 去重 + 自动捕获"
+    }
+  ]
+}

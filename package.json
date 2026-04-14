@@ -1,0 +1,52 @@
+{
+  "name": "claude-memory-pro",
+  "version": "1.0.0",
+  "description": "Claude Code 语义记忆增强插件 - 基于 LanceDB 向量数据库的混合检索记忆系统",
+  "type": "module",
+  "main": "dist/mcp-server.js",
+  "bin": {
+    "claude-memory-pro": "dist/mcp-server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/mcp-server.js",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "keywords": [
+    "claude-code",
+    "mcp",
+    "memory",
+    "vector-search",
+    "lancedb",
+    "semantic-retrieval",
+    "claude-plugin"
+  ],
+  "author": "asunoiwin",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/asunoiwin/claude-memory-pro.git"
+  },
+  "homepage": "https://github.com/asunoiwin/claude-memory-pro#readme",
+  "bugs": {
+    "url": "https://github.com/asunoiwin/claude-memory-pro/issues"
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "^0.26.2",
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "openai": "^4.77.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "files": [
+    "dist",
+    "src",
+    ".claude-plugin",
+    "scripts",
+    "README.md"
+  ]
+}
