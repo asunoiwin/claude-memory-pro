@@ -22,6 +22,7 @@ import { AutoCaptureEngine } from "./auto-capture.js";
 import { cleanupStoredMemories } from "./memory-cleaner.js";
 import { CaptureJournal } from "./capture-journal.js";
 import { AuditEngine } from "./audit.js";
+import { KnowledgeGraphManager, setKG, getKG } from "./knowledge-graph.js";
 
 // ============================================================================
 // Configuration
@@ -52,6 +53,8 @@ const retriever = createRetriever(store, embedder);
 const autoCapture = new AutoCaptureEngine(store, embedder);
 const captureJournal = new CaptureJournal();
 const auditEngine = new AuditEngine(store);
+const knowledgeGraph = new KnowledgeGraphManager(store);
+setKG(knowledgeGraph);
 
 const CATEGORIES = ["preference", "fact", "decision", "entity", "other"] as const;
 
@@ -106,7 +109,28 @@ server.tool(
     }
 
     const scopeFilter = scope ? [scope] : undefined;
+
+    // KG 辅助检索：先查图谱获取候选，再用向量检索补充
+    const kg = getKG();
+    let kgHints: string[] = [];
+    if (kg) {
+      const kgResults = kg.query(query, { limit: limit * 2 });
+      kgHints = kgResults.map(r => r.id);
+    }
+
     const results = await retriever.retrieve({ query, limit, scopeFilter, category });
+
+    // 如果 KG 有候选但向量检索没覆盖到，补充获取
+    if (kgHints.length > 0 && results.length < limit) {
+      const resultIds = new Set(results.map(r => r.entry.id));
+      const missingIds = kgHints.filter(id => !resultIds.has(id)).slice(0, limit - results.length);
+      if (missingIds.length > 0) {
+        const kgEntries = await store.getByIds(missingIds);
+        for (const entry of kgEntries) {
+          results.push({ entry, score: 0.4, sources: {} });
+        }
+      }
+    }
 
     if (results.length > 0) {
       recordRecallBatch(results.map(r => ({ id: r.entry.id, text: r.entry.text, category: r.entry.category })));
@@ -145,10 +169,14 @@ server.tool(
       };
     }
 
-    await store.store({
+    const newEntry = await store.store({
       text: text.slice(0, 500), vector, importance: safeImportance, category, scope,
       metadata: JSON.stringify({ source: "manual_store", storedAt: new Date().toISOString() }),
     });
+
+    // 增量更新 KG
+    const kg = getKG();
+    if (kg) kg.addNode(newEntry).catch(() => {});
 
     captureJournal.append({ content: text.slice(0, 500), category, importance: safeImportance, context: { source: 'manual_store' } });
 
@@ -402,6 +430,52 @@ server.tool(
   }
 );
 
+// -- memory_kg (Knowledge Graph) --
+server.tool(
+  "memory_kg",
+  "知识图谱（KG）管理。KG 是记忆的结构化索引，包含实体节点、5种关系边（causal/temporal/subject/category/contradicts）和矛盾检测。",
+  {
+    action: z.enum(["stats", "rebuild", "query", "contradictions", "debug"]).default("stats").describe("stats/rebuild/query/contradictions/debug"),
+    query: z.string().optional().describe("查询文本（action=query时）"),
+    memoryIds: z.array(z.string()).optional().describe("记忆ID列表（action=contradictions时）"),
+  },
+  async ({ action, query, memoryIds }) => {
+    const kg = getKG();
+    if (!kg) return { content: [{ type: "text" as const, text: "KG 未初始化。" }] };
+
+    if (action === "rebuild") {
+      await kg.build();
+      const s = kg.getStats();
+      return { content: [{ type: "text" as const, text: `KG 已重建：\n• 节点：${s.totalNodes}\n• 边：${s.totalEdges}\n• 实体：${s.entityKeys}\n• 分类：${s.categories}\n• 被取代：${s.supersededNodes}\n• 边分布：subject=${s.edgesByRelation.subject}, temporal=${s.edgesByRelation.temporal}, causal=${s.edgesByRelation.causal}, category=${s.edgesByRelation.category}, contradicts=${s.edgesByRelation.contradicts}` }] };
+    }
+
+    if (action === "query" && query) {
+      const results = kg.query(query, { limit: 10 });
+      if (results.length === 0) return { content: [{ type: "text" as const, text: "KG 中未找到匹配。" }] };
+      const lines = results.map((r, i) => `${i + 1}. [${r.reason}] ${r.summary.slice(0, 100)} (score=${r.score.toFixed(2)}, imp=${r.importance}, entity=${r.entityKey || 'N/A'}${r.superseded ? ' [已取代]' : ''})`);
+      return { content: [{ type: "text" as const, text: `KG 查询「${query}」（${results.length}条）：\n${lines.join("\n")}` }] };
+    }
+
+    if (action === "contradictions") {
+      const ids = memoryIds || [];
+      if (ids.length === 0) return { content: [{ type: "text" as const, text: "请提供 memoryIds 列表。" }] };
+      const contradictions = kg.getContradictions(ids);
+      if (contradictions.length === 0) return { content: [{ type: "text" as const, text: "未检测到矛盾。" }] };
+      const lines = contradictions.map(c => `• ${c.a.slice(0, 8)} <-> ${c.b.slice(0, 8)} (权重: ${c.weight})`);
+      return { content: [{ type: "text" as const, text: `检测到 ${contradictions.length} 对矛盾：\n${lines.join("\n")}` }] };
+    }
+
+    if (action === "debug") {
+      const path = kg.writeDebugSnapshot();
+      return { content: [{ type: "text" as const, text: `KG 调试快照已写入：${path}` }] };
+    }
+
+    // stats
+    const s = kg.getStats();
+    return { content: [{ type: "text" as const, text: `KG 状态：\n• 节点：${s.totalNodes}（${s.supersededNodes} 被取代）\n• 边：${s.totalEdges}\n• 实体：${s.entityKeys}\n• 分类：${s.categories}\n• 构建时间：${s.builtAt || '未构建'}\n• 边分布：subject=${s.edgesByRelation.subject}, temporal=${s.edgesByRelation.temporal}, causal=${s.edgesByRelation.causal}, category=${s.edgesByRelation.category}, contradicts=${s.edgesByRelation.contradicts}` }] };
+  }
+);
+
 // ============================================================================
 // Start
 // ============================================================================
@@ -411,6 +485,16 @@ async function main() {
     console.error("[claude-memory-pro] 警告：EMBEDDING_API_KEY 未设置");
   }
   await store.init();
+
+  // 构建知识图谱
+  try {
+    await knowledgeGraph.build();
+    const kgStats = knowledgeGraph.getStats();
+    console.error(`[claude-memory-pro] KG built: ${kgStats.totalNodes} nodes, ${kgStats.totalEdges} edges, ${kgStats.entityKeys} entities`);
+  } catch (err) {
+    console.error(`[claude-memory-pro] KG build failed: ${err}`);
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[claude-memory-pro] MCP Server v2.0.0 started");
