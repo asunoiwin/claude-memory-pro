@@ -61,7 +61,8 @@ function formatResults(results: RetrievalResult[]): string {
     if (r.sources.vector) sources.push("vector");
     if (r.sources.bm25) sources.push("BM25");
     if (r.sources.reranked) sources.push("reranked");
-    const meta = r.entry.metadata ? JSON.parse(r.entry.metadata) : {};
+    let meta: Record<string, any> = {};
+    try { if (r.entry.metadata) meta = JSON.parse(r.entry.metadata); } catch { /* ignore */ }
     const metaParts: string[] = [];
     if (meta.taskId) metaParts.push(`task=${meta.taskId}`);
     if (meta.source) metaParts.push(`source=${meta.source}`);
@@ -98,6 +99,9 @@ server.tool(
       store.incrementRecallBatch(results.map(r => r.entry.id)).catch(() => {});
     }
 
+    if (results.length === 0) {
+      return { content: [{ type: "text", text: "未找到相关记忆。" }] };
+    }
     return { content: [{ type: "text", text: `找到 ${results.length} 条记忆：\n\n${formatResults(results)}` }] };
   }
 );
@@ -276,6 +280,11 @@ server.tool(
 // ============================================================================
 
 async function main() {
+  if (!EMBEDDING_API_KEY) {
+    console.error("[claude-memory-pro] 警告：EMBEDDING_API_KEY 未设置，嵌入功能将不可用");
+    console.error("[claude-memory-pro] 请在 MCP 配置中设置 EMBEDDING_API_KEY 环境变量");
+  }
+
   await store.init();
 
   const transport = new StdioServerTransport();

@@ -102,9 +102,13 @@ export class MemoryStore {
     try {
       await this.table.createIndex("text", { config: lancedb.Index.fts() });
       this._hasFts = true;
-    } catch {
-      // FTS index may already exist or not be supported
-      this._hasFts = true;
+    } catch (err) {
+      // Index already exists → FTS is available; other errors → FTS unavailable
+      const msg = err instanceof Error ? err.message : String(err);
+      this._hasFts = /already exists|already indexed/i.test(msg);
+      if (!this._hasFts) {
+        console.error(`[claude-memory-pro] FTS 索引创建失败，回退到纯向量模式: ${msg}`);
+      }
     }
   }
 
@@ -152,7 +156,7 @@ export class MemoryStore {
           recallCount: row.recallCount || 0,
           lastRecallAt: row.lastRecallAt || 0,
         },
-        score: 1 - (row._distance || 0),
+        score: Math.max(0, 1 - (row._distance || 0)),
       }))
       .filter((r: MemorySearchResult) => r.score >= minScore);
   }
@@ -291,13 +295,16 @@ export class MemoryStore {
       conditions.push(`category = '${escapeSqlLiteral(category)}'`);
     }
 
-    let query = this.table.search(new Array(this.config.vectorDim).fill(0)).limit(safeLimit + offset);
+    // Use a zero-vector search to scan entries, then sort by timestamp (newest first)
+    let query = this.table.search(new Array(this.config.vectorDim).fill(0)).limit(safeLimit + offset + 200);
     if (conditions.length > 0) {
       query = query.where(conditions.join(" AND "));
     }
 
     const results = await query.toArray();
-    return results.slice(offset).map((row: any) => ({
+    // Sort by timestamp descending (newest first) instead of vector distance
+    results.sort((a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0));
+    return results.slice(offset, offset + safeLimit).map((row: any) => ({
       id: row.id,
       text: row.text,
       vector: Array.from(row.vector || []) as number[],
@@ -316,7 +323,8 @@ export class MemoryStore {
     scopeCounts: Record<string, number>;
     categoryCounts: Record<string, number>;
   }> {
-    const entries = await this.list(scopeFilter, undefined, 500);
+    // Scan up to 5000 entries for accurate stats
+    const entries = await this.list(scopeFilter, undefined, 5000);
     const scopeCounts: Record<string, number> = {};
     const categoryCounts: Record<string, number> = {};
     for (const entry of entries) {
