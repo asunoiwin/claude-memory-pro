@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Claude Memory Pro - MCP Server
- * 基于 LanceDB 的语义记忆增强系统，为 Claude Code 提供长期记忆能力
+ * Claude Memory Pro - MCP Server v2.0.0
+ * LanceDB 语义记忆增强 + 知识图谱 + 记忆晋升 + 自动捕获
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -15,6 +15,13 @@ import { MemoryStore } from "./store.js";
 import { createEmbedder, getVectorDimensions } from "./embedder.js";
 import { createRetriever, type RetrievalResult } from "./retriever.js";
 import { isNoise } from "./noise-filter.js";
+import { shouldSkipRetrieval } from "./adaptive-retrieval.js";
+import { refreshMemoryAtlas, getMemoryAtlasStatus, getAtlasHintsForQuery } from "./memory-atlas.js";
+import { recordRecallBatch, generateHabitCandidates, buildInstinctContext, getHabitSummary, refreshHabitArtifacts } from "./habit-tracker.js";
+import { AutoCaptureEngine } from "./auto-capture.js";
+import { cleanupStoredMemories } from "./memory-cleaner.js";
+import { CaptureJournal } from "./capture-journal.js";
+import { AuditEngine } from "./audit.js";
 
 // ============================================================================
 // Configuration
@@ -42,6 +49,9 @@ const embedder = createEmbedder({
   dimensions: EMBEDDING_DIMENSIONS,
 });
 const retriever = createRetriever(store, embedder);
+const autoCapture = new AutoCaptureEngine(store, embedder);
+const captureJournal = new CaptureJournal();
+const auditEngine = new AuditEngine(store);
 
 const CATEGORIES = ["preference", "fact", "decision", "entity", "other"] as const;
 
@@ -77,13 +87,13 @@ function formatResults(results: RetrievalResult[]): string {
 
 const server = new McpServer({
   name: "claude-memory-pro",
-  version: "1.0.0",
+  version: "2.0.0",
 });
 
 // -- memory_recall --
 server.tool(
   "memory_recall",
-  "语义检索长期记忆。使用混合检索（向量 + BM25）查找相关记忆，支持时间衰减、重要性加权和 MMR 去重。",
+  "语义检索长期记忆。混合检索（向量 + BM25），支持时间衰减、重要性加权、MMR 去重、自适应跳过。",
   {
     query: z.string().describe("搜索查询文本"),
     limit: z.number().min(1).max(20).default(5).describe("最大返回数量（默认5）"),
@@ -91,18 +101,22 @@ server.tool(
     category: z.enum(CATEGORIES).optional().describe("限定记忆分类（可选）"),
   },
   async ({ query, limit, scope, category }) => {
+    if (shouldSkipRetrieval(query)) {
+      return { content: [{ type: "text" as const, text: "查询过短或为系统命令，已跳过检索。" }] };
+    }
+
     const scopeFilter = scope ? [scope] : undefined;
     const results = await retriever.retrieve({ query, limit, scopeFilter, category });
 
-    // 更新召回计数
     if (results.length > 0) {
+      recordRecallBatch(results.map(r => ({ id: r.entry.id, text: r.entry.text, category: r.entry.category })));
       store.incrementRecallBatch(results.map(r => r.entry.id)).catch(() => {});
     }
 
     if (results.length === 0) {
-      return { content: [{ type: "text", text: "未找到相关记忆。" }] };
+      return { content: [{ type: "text" as const, text: "未找到相关记忆。" }] };
     }
-    return { content: [{ type: "text", text: `找到 ${results.length} 条记忆：\n\n${formatResults(results)}` }] };
+    return { content: [{ type: "text" as const, text: `找到 ${results.length} 条记忆：\n\n${formatResults(results)}` }] };
   }
 );
 
@@ -118,34 +132,28 @@ server.tool(
   },
   async ({ text, importance, category, scope }) => {
     if (isNoise(text)) {
-      return { content: [{ type: "text", text: "跳过：文本被识别为噪音（问候、模板语句等）" }] };
+      return { content: [{ type: "text" as const, text: "跳过：文本被识别为噪音" }] };
     }
 
     const safeImportance = clamp01(importance);
     const vector = await embedder.embedPassage(text.slice(0, 500));
 
-    // 去重检查
     const existing = await store.vectorSearch(vector, 1, 0.1, [scope]);
     if (existing.length > 0 && existing[0].score > 0.98) {
       return {
-        content: [{ type: "text", text: `已存在相似记忆：「${existing[0].entry.text}」（相似度 ${(existing[0].score * 100).toFixed(0)}%）` }],
+        content: [{ type: "text" as const, text: `已存在相似记忆：「${existing[0].entry.text}」（相似度 ${(existing[0].score * 100).toFixed(0)}%）` }],
       };
     }
 
-    const entry = await store.store({
-      text: text.slice(0, 500),
-      vector,
-      importance: safeImportance,
-      category,
-      scope,
-      metadata: JSON.stringify({
-        source: "manual_store",
-        storedAt: new Date().toISOString(),
-      }),
+    await store.store({
+      text: text.slice(0, 500), vector, importance: safeImportance, category, scope,
+      metadata: JSON.stringify({ source: "manual_store", storedAt: new Date().toISOString() }),
     });
 
+    captureJournal.append({ content: text.slice(0, 500), category, importance: safeImportance, context: { source: 'manual_store' } });
+
     return {
-      content: [{ type: "text", text: `已存储：「${text.slice(0, 100)}${text.length > 100 ? "..." : ""}」 → 域 '${scope}'，分类 '${category}'，重要性 ${safeImportance}` }],
+      content: [{ type: "text" as const, text: `已存储：「${text.slice(0, 100)}${text.length > 100 ? "..." : ""}」 → 域 '${scope}'，分类 '${category}'，重要性 ${safeImportance}` }],
     };
   }
 );
@@ -161,25 +169,21 @@ server.tool(
   async ({ query, memoryId }) => {
     if (memoryId) {
       const deleted = await store.delete(memoryId);
-      return {
-        content: [{ type: "text", text: deleted ? `已删除记忆 ${memoryId}` : `未找到记忆 ${memoryId}` }],
-      };
+      return { content: [{ type: "text" as const, text: deleted ? `已删除记忆 ${memoryId}` : `未找到记忆 ${memoryId}` }] };
     }
-
     if (query) {
       const results = await retriever.retrieve({ query, limit: 5 });
       if (results.length === 0) {
-        return { content: [{ type: "text", text: "未找到匹配的记忆。" }] };
+        return { content: [{ type: "text" as const, text: "未找到匹配的记忆。" }] };
       }
       if (results.length === 1 && results[0].score > 0.9) {
         await store.delete(results[0].entry.id);
-        return { content: [{ type: "text", text: `已删除：「${results[0].entry.text}」` }] };
+        return { content: [{ type: "text" as const, text: `已删除：「${results[0].entry.text}」` }] };
       }
       const list = results.map(r => `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}...`).join("\n");
-      return { content: [{ type: "text", text: `找到 ${results.length} 条候选记忆，请指定 memoryId 删除：\n${list}` }] };
+      return { content: [{ type: "text" as const, text: `找到 ${results.length} 条候选，请指定 memoryId：\n${list}` }] };
     }
-
-    return { content: [{ type: "text", text: "请提供 query 或 memoryId 参数。" }] };
+    return { content: [{ type: "text" as const, text: "请提供 query 或 memoryId。" }] };
   }
 );
 
@@ -195,28 +199,19 @@ server.tool(
   },
   async ({ memoryId, text, importance, category }) => {
     if (!text && importance === undefined && !category) {
-      return { content: [{ type: "text", text: "至少提供一项更新：text、importance 或 category。" }] };
+      return { content: [{ type: "text" as const, text: "至少提供一项更新。" }] };
     }
-
     const updates: Record<string, any> = {};
     if (text) {
-      if (isNoise(text)) {
-        return { content: [{ type: "text", text: "跳过：更新文本被识别为噪音。" }] };
-      }
+      if (isNoise(text)) return { content: [{ type: "text" as const, text: "跳过：噪音文本。" }] };
       updates.text = text;
       updates.vector = await embedder.embedPassage(text);
     }
     if (importance !== undefined) updates.importance = clamp01(importance);
     if (category) updates.category = category;
-
     const updated = await store.update(memoryId, updates);
-    if (!updated) {
-      return { content: [{ type: "text", text: `未找到记忆 ${memoryId}` }] };
-    }
-
-    return {
-      content: [{ type: "text", text: `已更新记忆 ${updated.id.slice(0, 8)}：「${updated.text.slice(0, 80)}...」` }],
-    };
+    if (!updated) return { content: [{ type: "text" as const, text: `未找到记忆 ${memoryId}` }] };
+    return { content: [{ type: "text" as const, text: `已更新 ${updated.id.slice(0, 8)}：「${updated.text.slice(0, 80)}」` }] };
   }
 );
 
@@ -225,7 +220,7 @@ server.tool(
   "memory_list",
   "列出最近的记忆，支持按域和分类过滤。",
   {
-    limit: z.number().min(1).max(50).default(10).describe("最大数量（默认10）"),
+    limit: z.number().min(1).max(50).default(10).describe("最大数量"),
     scope: z.string().optional().describe("按域过滤"),
     category: z.enum(CATEGORIES).optional().describe("按分类过滤"),
     offset: z.number().min(0).default(0).describe("跳过前 N 条"),
@@ -233,29 +228,27 @@ server.tool(
   async ({ limit, scope, category, offset }) => {
     const scopeFilter = scope ? [scope] : undefined;
     const entries = await store.list(scopeFilter, category, limit, offset);
-
-    if (entries.length === 0) {
-      return { content: [{ type: "text", text: "暂无记忆。" }] };
-    }
-
+    if (entries.length === 0) return { content: [{ type: "text" as const, text: "暂无记忆。" }] };
     const text = entries.map((e, i) => {
       const date = new Date(e.timestamp).toISOString().split("T")[0];
       return `${offset + i + 1}. [${e.category}:${e.scope}] ${e.text.slice(0, 100)}${e.text.length > 100 ? "..." : ""} (${date})`;
     }).join("\n");
-
-    return { content: [{ type: "text", text: `记忆列表（共 ${entries.length} 条）：\n\n${text}` }] };
+    return { content: [{ type: "text" as const, text: `记忆列表（${entries.length}条）：\n\n${text}` }] };
   }
 );
 
 // -- memory_stats --
 server.tool(
   "memory_stats",
-  "查看记忆系统统计信息：总数、各分类/域分布、检索配置等。",
+  "查看记忆系统完整统计：总数、分布、习惯追踪、知识图谱、捕获队列。",
   {},
   async () => {
     const stats = await store.stats();
     const config = retriever.getConfig();
     const cacheStats = embedder.cacheStats;
+    const habitSummary = getHabitSummary();
+    const atlasStatus = getMemoryAtlasStatus();
+    const journalStats = captureJournal.stats();
 
     const lines = [
       `记忆统计：`,
@@ -263,39 +256,169 @@ server.tool(
       `• 检索模式：${config.mode}`,
       `• FTS 支持：${store.hasFtsSupport ? "是" : "否"}`,
       `• 嵌入缓存：${cacheStats.size} 条，命中率 ${cacheStats.hitRate}`,
-      ``,
-      `按域分布：`,
+      ``, `按域分布：`,
       ...Object.entries(stats.scopeCounts).map(([s, c]) => `  • ${s}: ${c}`),
-      ``,
-      `按分类分布：`,
+      ``, `按分类分布：`,
       ...Object.entries(stats.categoryCounts).map(([c, n]) => `  • ${c}: ${n}`),
+      ``, `习惯追踪：`,
+      `  • 总追踪：${habitSummary.total}，promote: ${habitSummary.promote}，reinforce: ${habitSummary.reinforce}，retain: ${habitSummary.retain}`,
+      ``, `知识图谱：${atlasStatus ? `已生成（${atlasStatus.totalIndexed || 0}条，${Array.isArray(atlasStatus.clusters) ? atlasStatus.clusters.length : 0}个聚类）` : '未生成'}`,
+      ``, `捕获队列：总计${journalStats.total}，待处理${journalStats.pending}`,
     ];
-
-    return { content: [{ type: "text", text: lines.join("\n") }] };
+    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
   }
 );
 
 // ============================================================================
-// Start Server
+// 新工具：知识图谱、习惯追踪、自动捕获、清理、审计
+// ============================================================================
+
+// -- memory_atlas (知识图谱) --
+server.tool(
+  "memory_atlas",
+  "构建或查看记忆知识图谱。分析记忆生成聚类、锚点和关联边。",
+  {
+    action: z.enum(["refresh", "status", "query"]).default("status").describe("refresh=重建，status=查看，query=查询聚类"),
+    query: z.string().optional().describe("查询文本（action=query时）"),
+  },
+  async ({ action, query }) => {
+    if (action === "refresh") {
+      const atlas = await refreshMemoryAtlas(store);
+      const clusters = Array.isArray(atlas.clusters) ? atlas.clusters : [];
+      const edges = Array.isArray(atlas.edges) ? atlas.edges : [];
+      const lines = [
+        `知识图谱已刷新：`,
+        `• 索引：${atlas.totalIndexed}，聚类：${clusters.length}，边：${edges.length}`,
+        ``, `主要聚类：`,
+        ...clusters.slice(0, 10).map((c: any) => `  • ${c.label} (${c.count}条) — ${c.topTokens?.slice(0, 5).join(', ')}`),
+        ``, `关联：`,
+        ...edges.slice(0, 10).map((e: any) => `  • ${e.from} <-> ${e.to} (${e.weight}, ${e.reason})`),
+      ];
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    }
+    if (action === "query" && query) {
+      const hints = getAtlasHintsForQuery(query);
+      if (hints.clusterKeys.length === 0) {
+        return { content: [{ type: "text" as const, text: "未找到相关聚类。先 refresh 生成图谱。" }] };
+      }
+      return { content: [{ type: "text" as const, text: `查询「${query}」：\n• 聚类：${hints.summary.join(', ')}\n• 关联ID：${hints.anchorIds.slice(0, 5).map(id => id.slice(0, 8)).join(', ')}` }] };
+    }
+    const atlas = getMemoryAtlasStatus();
+    if (!atlas) return { content: [{ type: "text" as const, text: "知识图谱未生成。用 action='refresh' 构建。" }] };
+    const clusters = Array.isArray(atlas.clusters) ? atlas.clusters : [];
+    return { content: [{ type: "text" as const, text: `知识图谱：${atlas.generatedAt}\n• ${atlas.totalIndexed}条，${clusters.length}个聚类\n${clusters.slice(0, 8).map((c: any) => `  • ${c.label} (${c.count})`).join('\n')}` }] };
+  }
+);
+
+// -- memory_habits (记忆晋升) --
+server.tool(
+  "memory_habits",
+  "记忆晋升系统。追踪高频召回，按 retain->reinforce->promote 晋升，写入 instinct-rollup.md。",
+  {
+    action: z.enum(["status", "candidates", "instincts", "refresh"]).default("status").describe("status/candidates/instincts/refresh"),
+  },
+  async ({ action }) => {
+    if (action === "refresh") {
+      refreshHabitArtifacts();
+      const s = getHabitSummary();
+      return { content: [{ type: "text" as const, text: `已刷新 instinct-rollup.md\n• 总: ${s.total}, promote: ${s.promote}, reinforce: ${s.reinforce}` }] };
+    }
+    if (action === "candidates") {
+      const c = generateHabitCandidates();
+      if (c.length === 0) return { content: [{ type: "text" as const, text: "暂无候选。" }] };
+      const lines = c.slice(0, 20).map((x, i) => `${i + 1}. [${x.promotionTier}:${x.category}] ${x.memoryText}\n   ${x.recallCount}次, v=${x.recentRecallVelocity}, ${x.reason}`);
+      return { content: [{ type: "text" as const, text: `候选（${c.length}）：\n${lines.join("\n")}` }] };
+    }
+    if (action === "instincts") {
+      const ctx = buildInstinctContext();
+      return { content: [{ type: "text" as const, text: ctx || "暂无工作先验。" }] };
+    }
+    const s = getHabitSummary();
+    return { content: [{ type: "text" as const, text: `习惯追踪：总${s.total}, promote=${s.promote}, reinforce=${s.reinforce}, retain=${s.retain}` }] };
+  }
+);
+
+// -- memory_capture (自动捕获) --
+server.tool(
+  "memory_capture",
+  "自动分析并捕获重要内容。关键词匹配分类（task/rule/decision/correction/preference）。",
+  {
+    text: z.string().describe("要分析的文本"),
+    category: z.string().optional().describe("强制分类"),
+    importance: z.number().min(0).max(1).optional().describe("强制重要性"),
+    scope: z.string().default("global").describe("记忆域"),
+  },
+  async ({ text, category, importance, scope }) => {
+    const result = await autoCapture.capture(text, category, importance, { scope });
+    if (!result) return { content: [{ type: "text" as const, text: "未触发捕获。" }] };
+    return { content: [{ type: "text" as const, text: `已捕获：${result.type}，重要性=${result.importance}` }] };
+  }
+);
+
+// -- memory_cleanup --
+server.tool(
+  "memory_cleanup",
+  "清理记忆：删噪音、去重、摘要压缩。",
+  {
+    limit: z.number().min(20).max(500).default(200).describe("扫描上限"),
+    maxAgeDays: z.number().min(1).max(365).default(90).describe("清理范围（天）"),
+  },
+  async ({ limit, maxAgeDays }) => {
+    const r = await cleanupStoredMemories(store, embedder, { limit, maxAgeDays });
+    return { content: [{ type: "text" as const, text: `清理完成：扫描${r.scanned}，删噪${r.deleted}，去重${r.deduped}，压缩${r.cleaned}` }] };
+  }
+);
+
+// -- memory_audit --
+server.tool(
+  "memory_audit",
+  "记忆系统健康审计。",
+  {},
+  async () => {
+    const r = await auditEngine.runAudit();
+    return { content: [{ type: "text" as const, text: `审计：总${r.stats.total_memories}，问题${r.stats.issues}` }] };
+  }
+);
+
+// -- memory_journal (捕获队列) --
+server.tool(
+  "memory_journal",
+  "捕获队列管理：查看待处理条目和统计。",
+  {
+    action: z.enum(["stats", "pending", "prune"]).default("stats").describe("stats/pending/prune"),
+  },
+  async ({ action }) => {
+    if (action === "pending") {
+      const p = captureJournal.listPending(20);
+      if (p.length === 0) return { content: [{ type: "text" as const, text: "无待处理。" }] };
+      return { content: [{ type: "text" as const, text: `待处理(${p.length})：\n${p.map((e, i) => `${i + 1}. ${e.content.slice(0, 80)}...`).join("\n")}` }] };
+    }
+    if (action === "prune") {
+      captureJournal.prune();
+      return { content: [{ type: "text" as const, text: "已清理。" }] };
+    }
+    const s = captureJournal.stats();
+    return { content: [{ type: "text" as const, text: `队列：总${s.total}，待处理${s.pending}，已捕获${s.captured}` }] };
+  }
+);
+
+// ============================================================================
+// Start
 // ============================================================================
 
 async function main() {
   if (!EMBEDDING_API_KEY) {
-    console.error("[claude-memory-pro] 警告：EMBEDDING_API_KEY 未设置，嵌入功能将不可用");
-    console.error("[claude-memory-pro] 请在 MCP 配置中设置 EMBEDDING_API_KEY 环境变量");
+    console.error("[claude-memory-pro] 警告：EMBEDDING_API_KEY 未设置");
   }
-
   await store.init();
-
   const transport = new StdioServerTransport();
   await server.connect(transport);
-
-  console.error("[claude-memory-pro] MCP Server started");
-  console.error(`[claude-memory-pro] DB: ${DB_PATH}`);
-  console.error(`[claude-memory-pro] Model: ${EMBEDDING_MODEL}`);
+  console.error("[claude-memory-pro] MCP Server v2.0.0 started");
+  console.error(`[claude-memory-pro] DB: ${DB_PATH}, Model: ${EMBEDDING_MODEL}`);
+  console.error("[claude-memory-pro] Features: atlas, habits, capture, cleanup, journal, audit");
 }
 
 main().catch(err => {
-  console.error("[claude-memory-pro] Fatal error:", err);
+  console.error("[claude-memory-pro] Fatal:", err);
   process.exit(1);
 });

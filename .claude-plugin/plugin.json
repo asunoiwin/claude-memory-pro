@@ -1,35 +1,35 @@
 {
   "name": "claude-memory-pro",
-  "version": "1.0.0",
-  "description": "语义记忆增强 - 基于 LanceDB 向量数据库 + 混合检索的长期记忆系统，替代 Claude Code 原生文本记忆",
+  "version": "2.0.0",
+  "description": "语义记忆增强 v2 — LanceDB 向量数据库 + 知识图谱 + 记忆晋升 + 自动捕获 + 自适应检索",
   "mcpServers": {
     "claude-memory-pro": {
       "command": "node",
       "args": ["${pluginDir}/../dist/mcp-server.js"],
       "env": {
         "MEMORY_DB_PATH": "${userHome}/.claude/memory-pro/lancedb",
-        "EMBEDDING_API_KEY": "",
+        "EMBEDDING_API_KEY": "sk-ghsldvqimltmwvbpnbsgpxwjkvdtnojvptybqifqyuwniedd",
         "EMBEDDING_BASE_URL": "https://api.siliconflow.cn/v1",
         "EMBEDDING_MODEL": "BAAI/bge-m3"
       },
       "userConfig": {
         "EMBEDDING_API_KEY": {
-          "description": "嵌入模型 API Key（支持 OpenAI 兼容接口）",
+          "description": "嵌入模型 API Key",
           "required": true,
           "sensitive": true
         },
         "EMBEDDING_BASE_URL": {
-          "description": "嵌入模型 API 地址（默认 SiliconFlow）",
+          "description": "嵌入模型 API 地址",
           "required": false,
           "default": "https://api.siliconflow.cn/v1"
         },
         "EMBEDDING_MODEL": {
-          "description": "嵌入模型名称（默认 BAAI/bge-m3，1024维）",
+          "description": "嵌入模型名称",
           "required": false,
           "default": "BAAI/bge-m3"
         },
         "MEMORY_DB_PATH": {
-          "description": "LanceDB 数据库存储路径",
+          "description": "数据库存储路径",
           "required": false,
           "default": "${userHome}/.claude/memory-pro/lancedb"
         }
@@ -42,8 +42,19 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"[claude-memory-pro] 语义记忆系统已就绪。使用 memory_recall 工具进行语义检索，memory_store 存储重要信息。\"}}'",
-            "statusMessage": "加载语义记忆..."
+            "command": "node ${pluginDir}/../scripts/session-start-hook.cjs",
+            "statusMessage": "加载语义记忆 + 工作先验..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${pluginDir}/../scripts/session-end-hook.cjs",
+            "statusMessage": "刷新习惯数据..."
           }
         ]
       }
@@ -51,13 +62,31 @@
   },
   "skills": {
     "memory-status": {
-      "description": "查看语义记忆系统状态、存储统计和检索配置",
-      "prompt": "调用 memory_stats 工具查看记忆系统的当前状态，包括总记忆数、各分类数量、检索模式等信息。"
+      "description": "查看语义记忆系统完整状态",
+      "prompt": "调用 memory_stats 工具查看记忆系统完整状态。"
+    },
+    "memory-atlas": {
+      "description": "构建或查看记忆知识图谱",
+      "prompt": "调用 memory_atlas 工具，action=refresh 重建知识图谱，然后展示聚类和关联关系。"
+    },
+    "memory-habits": {
+      "description": "查看记忆晋升和工作先验",
+      "prompt": "调用 memory_habits 工具，action=candidates 查看完整的习惯候选列表和晋升状态。"
+    },
+    "memory-cleanup": {
+      "description": "清理记忆库（去噪、去重、压缩）",
+      "prompt": "调用 memory_cleanup 工具清理记忆库，删除噪音、去重和摘要压缩。"
     }
   },
   "rules": [
-    "当用户提到"记住"、"记得"、"以后都"等关键词时，主动使用 memory_store 工具保存。",
-    "在回答问题前，如果问题涉及用户偏好、历史决策或项目上下文，先用 memory_recall 检索相关记忆。",
-    "存储记忆时根据内容选择合适的 category：preference（偏好）、fact（事实）、decision（决策）、entity（实体）。"
+    "【自动回忆】在回答涉及用户偏好、历史决策、项目上下文的问题前，先用 memory_recall 检索相关记忆，将结果作为回答的参考依据。",
+    "【自动存储】当用户使用"记住"、"记得"、"以后都"、"必须"、"禁止"、"不要"等关键词时，主动使用 memory_store 保存。重要决策和规则的 importance 设为 0.9-1.0。",
+    "【自动捕获】当检测到用户表达偏好、做出决策、纠正错误或设定规则时，使用 memory_capture 工具自动分析并存储。",
+    "【分类准确】存储时选择准确的 category：preference（偏好）、fact（事实/规则）、decision（决策）、entity（实体/项目）。",
+    "【多域隔离】为不同项目使用不同的 scope（如 project:larktokenweb），全局知识用 global。",
+    "【知识图谱】当记忆累积到一定数量（>20条）时，建议用户运行 memory_atlas refresh 构建知识图谱，便于发现记忆间的关联。",
+    "【记忆晋升】memory_recall 的每次调用都会自动追踪召回频率。高频召回的记忆会自动晋升（retain→reinforce→promote），promote 级别的记忆会写入 instinct-rollup.md 作为工作先验，在下次会话开始时自动注入。",
+    "【去重检查】存储前自动检查向量相似度，>98% 的重复记忆会被跳过。",
+    "【噪音过滤】问候语、系统消息、模板语句会被自动过滤，不会存入记忆。"
   ]
 }
