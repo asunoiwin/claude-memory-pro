@@ -12,6 +12,8 @@ const BASE_DIR = join(homedir(), '.claude', 'memory-pro');
 const ROLLUP_FILE = join(BASE_DIR, 'instinct-rollup.md');
 const HABIT_FILE = join(BASE_DIR, 'habit-candidates.json');
 const ATLAS_FILE = join(BASE_DIR, 'memory-atlas.json');
+const DREAM_FILE = join(BASE_DIR, 'dream.md');
+const DREAM_LAST_RUN = join(BASE_DIR, 'dream-last-run.json');
 
 function readFile(path) {
   try { return existsSync(path) ? readFileSync(path, 'utf8') : null; } catch { return null; }
@@ -56,8 +58,34 @@ function main() {
     parts.push(`知识图谱：${atlas.totalIndexed || 0} 条记忆，${atlas.clusters.length} 个主题聚类。`);
   }
 
+  // Dream 状态
+  const dreamLastRun = readJson(DREAM_LAST_RUN);
+  if (dreamLastRun) {
+    const phases = [];
+    if (dreamLastRun.light) phases.push(`light=${dreamLastRun.light.split('T')[0]}`);
+    if (dreamLastRun.deep) phases.push(`deep=${dreamLastRun.deep.split('T')[0]}`);
+    if (dreamLastRun.rem) phases.push(`rem=${dreamLastRun.rem.split('T')[0]}`);
+    if (phases.length > 0) {
+      parts.push(`Dream 晋升：${phases.join('，')}`);
+    }
+  }
+
+  // 注入 dream.md 中的 promote/deep/rem 级晋升摘要
+  const dreamContent = readFile(DREAM_FILE);
+  if (dreamContent && dreamContent.trim()) {
+    const dreamLines = dreamContent.split('\n').filter(l => l.startsWith('- [dream:'));
+    const recentDream = dreamLines.slice(-5);
+    if (recentDream.length > 0) {
+      parts.push('');
+      parts.push('--- Dream Trail（近期晋升）---');
+      for (const line of recentDream) {
+        parts.push(line);
+      }
+    }
+  }
+
   parts.push('');
-  parts.push('可用工具：memory_recall / memory_store / memory_atlas / memory_habits / memory_capture / memory_cleanup / memory_audit / memory_journal');
+  parts.push('可用工具：memory_recall / memory_store / memory_atlas / memory_habits / memory_capture / memory_cleanup / memory_audit / memory_journal / memory_kg / memory_dream');
 
   const output = {
     hookSpecificOutput: {

@@ -23,6 +23,8 @@ import { cleanupStoredMemories } from "./memory-cleaner.js";
 import { CaptureJournal } from "./capture-journal.js";
 import { AuditEngine } from "./audit.js";
 import { KnowledgeGraphManager, setKG, getKG } from "./knowledge-graph.js";
+import { promoteMemoriesFromStore, recoverMissedPhases, getDreamStats, readDreamTrail, DEFAULT_CONFIG as DREAM_DEFAULT_CONFIG, type DreamConfig } from "./dream-manager.js";
+import { runDailyReorganization } from "./memory-daily-reorg.js";
 
 // ============================================================================
 // Configuration
@@ -62,6 +64,31 @@ const CATEGORIES = ["preference", "fact", "decision", "entity", "other"] as cons
 // Helpers
 // ============================================================================
 
+function cosineSimVectors(a: number[], b: number[]): number {
+  if (a.length === 0 || b.length === 0) return 0;
+  let dot = 0, nA = 0, nB = 0;
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    dot += a[i] * b[i]; nA += a[i] * a[i]; nB += b[i] * b[i];
+  }
+  const norm = Math.sqrt(nA) * Math.sqrt(nB);
+  return norm > 0 ? dot / norm : 0;
+}
+
+function mmrDedup(scored: RetrievalResult[], limit: number, threshold = 0.85): RetrievalResult[] {
+  const selected: RetrievalResult[] = [];
+  for (const candidate of scored) {
+    const tooSimilar = selected.some(s => {
+      const sVec = Array.from(s.entry.vector as Iterable<number>);
+      const cVec = Array.from(candidate.entry.vector as Iterable<number>);
+      return cosineSimVectors(sVec, cVec) > threshold;
+    });
+    if (!tooSimilar) selected.push(candidate);
+    if (selected.length >= limit) break;
+  }
+  return selected;
+}
+
 function clamp01(v: number, fallback = 0.7): number {
   if (!Number.isFinite(v)) return fallback;
   return Math.min(1, Math.max(0, v));
@@ -96,7 +123,7 @@ const server = new McpServer({
 // -- memory_recall --
 server.tool(
   "memory_recall",
-  "语义检索长期记忆。混合检索（向量 + BM25），支持时间衰减、重要性加权、MMR 去重、自适应跳过。",
+  "语义检索长期记忆。KG 多维路由（实体/时间/因果/分类）→ 向量精排。KG 为空时回退到纯向量检索。",
   {
     query: z.string().describe("搜索查询文本"),
     limit: z.number().min(1).max(20).default(5).describe("最大返回数量（默认5）"),
@@ -109,29 +136,56 @@ server.tool(
     }
 
     const scopeFilter = scope ? [scope] : undefined;
+    let results: RetrievalResult[] = [];
+    let recallPath = 'fallback';
 
-    // KG 辅助检索：先查图谱获取候选，再用向量检索补充
+    // === 主路径：KG 多维路由 → 向量精排 ===
     const kg = getKG();
-    let kgHints: string[] = [];
-    if (kg) {
-      const kgResults = kg.query(query, { limit: limit * 2 });
-      kgHints = kgResults.map(r => r.id);
-    }
+    if (kg && kg.getStats().totalNodes > 0) {
+      const kgCandidates = kg.query(query, { limit: limit * 4 });
 
-    const results = await retriever.retrieve({ query, limit, scopeFilter, category });
+      if (kgCandidates.length > 0) {
+        recallPath = 'kg_routed';
+        const candidateIds = kgCandidates.map(c => c.id);
+        const entries = await store.getByIds(candidateIds);
+        const entryMap = new Map(entries.map(e => [e.id, e]));
+        const queryVector = await embedder.embedQuery(query);
 
-    // 如果 KG 有候选但向量检索没覆盖到，补充获取
-    if (kgHints.length > 0 && results.length < limit) {
-      const resultIds = new Set(results.map(r => r.entry.id));
-      const missingIds = kgHints.filter(id => !resultIds.has(id)).slice(0, limit - results.length);
-      if (missingIds.length > 0) {
-        const kgEntries = await store.getByIds(missingIds);
-        for (const entry of kgEntries) {
-          results.push({ entry, score: 0.4, sources: {} });
+        const scored: RetrievalResult[] = [];
+        for (const kgResult of kgCandidates) {
+          const entry = entryMap.get(kgResult.id);
+          if (!entry) continue;
+          if (category && entry.category !== category) continue;
+          if (scopeFilter && !scopeFilter.includes(entry.scope)) continue;
+
+          const entryVector = Array.from(entry.vector as Iterable<number>);
+          const vectorSim = cosineSimVectors(queryVector, entryVector);
+          const combinedScore = Math.min(
+            kgResult.score * 0.4 + vectorSim * 0.4 + (entry.importance ?? 0.5) * 0.2,
+            1.0
+          );
+
+          scored.push({
+            entry, score: combinedScore,
+            sources: {
+              vector: { score: vectorSim, rank: 0 },
+              fused: { score: combinedScore },
+            },
+          });
         }
+
+        scored.sort((a, b) => b.score - a.score);
+        results = mmrDedup(scored, limit);
       }
     }
 
+    // === 回退路径：KG 为空（冷启动）→ 纯向量+BM25 检索 ===
+    if (results.length === 0) {
+      recallPath = 'vector_fallback';
+      results = await retriever.retrieve({ query, limit, scopeFilter, category });
+    }
+
+    // === 副作用：记录召回频率（暂存层，不影响排序） ===
     if (results.length > 0) {
       recordRecallBatch(results.map(r => ({ id: r.entry.id, text: r.entry.text, category: r.entry.category })));
       store.incrementRecallBatch(results.map(r => r.entry.id)).catch(() => {});
@@ -140,7 +194,8 @@ server.tool(
     if (results.length === 0) {
       return { content: [{ type: "text" as const, text: "未找到相关记忆。" }] };
     }
-    return { content: [{ type: "text" as const, text: `找到 ${results.length} 条记忆：\n\n${formatResults(results)}` }] };
+    const pathLabel = recallPath === 'kg_routed' ? 'KG路由' : '向量回退';
+    return { content: [{ type: "text" as const, text: `[${pathLabel}] 找到 ${results.length} 条记忆：\n\n${formatResults(results)}` }] };
   }
 );
 
@@ -178,7 +233,8 @@ server.tool(
     const kg = getKG();
     if (kg) kg.addNode(newEntry).catch(() => {});
 
-    captureJournal.append({ content: text.slice(0, 500), category, importance: safeImportance, context: { source: 'manual_store' } });
+    const journalEntry = captureJournal.append({ content: text.slice(0, 500), category, importance: safeImportance, context: { source: 'manual_store' } });
+    captureJournal.update(journalEntry.id, { status: 'captured' });
 
     return {
       content: [{ type: "text" as const, text: `已存储：「${text.slice(0, 100)}${text.length > 100 ? "..." : ""}」 → 域 '${scope}'，分类 '${category}'，重要性 ${safeImportance}` }],
@@ -379,7 +435,8 @@ server.tool(
   async ({ text, category, importance, scope }) => {
     const result = await autoCapture.capture(text, category, importance, { scope });
     if (!result) return { content: [{ type: "text" as const, text: "未触发捕获。" }] };
-    return { content: [{ type: "text" as const, text: `已捕获：${result.type}，重要性=${result.importance}` }] };
+    const method = result.llmUsed ? '（LLM 分析）' : '（关键词匹配）';
+    return { content: [{ type: "text" as const, text: `已捕获${method}：${result.type}，重要性=${result.importance}` }] };
   }
 );
 
@@ -476,6 +533,79 @@ server.tool(
   }
 );
 
+// -- memory_dream (Dream 记忆晋升) --
+server.tool(
+  "memory_dream",
+  "Dream 记忆晋升系统。三阶段晋升（light/deep/REM），基于召回频率自动提升记忆，写入 dream.md。支持手动触发、查看 trail、日常整理。",
+  {
+    action: z.enum(["status", "run", "trail", "recover", "reorg"]).default("status")
+      .describe("status=查看状态，run=执行晋升，trail=查看dream.md，recover=恢复错过的阶段，reorg=日常整理"),
+    phase: z.enum(["light", "deep", "rem"]).optional()
+      .describe("晋升阶段（action=run时，默认light）"),
+  },
+  async ({ action, phase }) => {
+    if (action === "run") {
+      const mode = phase || "light";
+      const config: DreamConfig = { ...DREAM_DEFAULT_CONFIG, mode };
+      const result = await promoteMemoriesFromStore(store, config);
+      const lines = [
+        `Dream 晋升完成（${mode.toUpperCase()}）：`,
+        `• 候选：${result.candidates.length}`,
+        `• 写入：${result.written}`,
+        `• 跳过（已晋升）：${result.skipped}`,
+      ];
+      if (result.decisions.length > 0) {
+        lines.push(``, `决策详情：`);
+        for (const d of result.decisions.slice(0, 15)) {
+          const status = d.written ? '✓' : d.reason === 'already_promoted_same_or_higher' ? `跳过(已${d.existingPhase})` : '✗';
+          lines.push(`  ${status} ${d.memoryId.slice(0, 8)} → ${d.tier}`);
+        }
+      }
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    }
+
+    if (action === "trail") {
+      const trail = readDreamTrail();
+      if (!trail.trim()) return { content: [{ type: "text" as const, text: "dream.md 为空，尚无晋升记录。" }] };
+      // 只返回最后 2000 字符
+      const truncated = trail.length > 2000 ? '...\n' + trail.slice(-2000) : trail;
+      return { content: [{ type: "text" as const, text: truncated }] };
+    }
+
+    if (action === "recover") {
+      const result = await recoverMissedPhases(store, DREAM_DEFAULT_CONFIG);
+      if (result.recovered.length === 0) {
+        return { content: [{ type: "text" as const, text: "无需恢复，所有阶段均在有效期内。" }] };
+      }
+      return { content: [{ type: "text" as const, text: `已恢复错过的阶段：${result.recovered.join(', ')}` }] };
+    }
+
+    if (action === "reorg") {
+      const kg = getKG();
+      const result = await runDailyReorganization(
+        store,
+        async (s) => refreshMemoryAtlas(s),
+        kg ? async () => { await kg.build(); } : undefined
+      );
+      return { content: [{ type: "text" as const, text: `日常整理完成（${result.duration}ms）：\n• Atlas: ${result.atlasRebuilt ? `已重建(${result.atlasEntries}条)` : '跳过'}\n• KG: ${result.kgRebuilt ? '已重建' : '跳过'}\n• 实体组: ${result.entityGroups}\n• 矛盾: ${result.contradictions}\n• 取代: ${result.superseded}\n• 过期: ${result.expiredMarked}` }] };
+    }
+
+    // status
+    const stats = getDreamStats();
+    const lastRun = stats.lastRunState;
+    const promotedCount = Object.keys(stats.trailState.promoted).length;
+    const lines = [
+      `Dream 状态：`,
+      `• trail 段落：${stats.totalSections}`,
+      `• 累计晋升：${promotedCount} 条记忆`,
+      `• 上次 LIGHT：${lastRun.light || '从未'}`,
+      `• 上次 DEEP：${lastRun.deep || '从未'}`,
+      `• 上次 REM：${lastRun.rem || '从未'}`,
+    ];
+    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+  }
+);
+
 // ============================================================================
 // Start
 // ============================================================================
@@ -495,14 +625,59 @@ async function main() {
     console.error(`[claude-memory-pro] KG build failed: ${err}`);
   }
 
+  // Dream 恢复：补偿离线期间错过的晋升
+  try {
+    const dreamRecovery = await recoverMissedPhases(store, DREAM_DEFAULT_CONFIG);
+    if (dreamRecovery.recovered.length > 0) {
+      console.error(`[claude-memory-pro] Dream recovery: ${dreamRecovery.recovered.join(', ')}`);
+    }
+  } catch (err) {
+    console.error(`[claude-memory-pro] Dream recovery failed: ${err}`);
+  }
+
+  // Dream 定时器：运行期间每 30 分钟自动执行 light 晋升
+  const DREAM_INTERVAL_MS = 30 * 60 * 1000; // 30 min
+  setInterval(async () => {
+    try {
+      const result = await promoteMemoriesFromStore(store, { ...DREAM_DEFAULT_CONFIG, mode: 'light' });
+      if (result.written > 0) {
+        console.error(`[claude-memory-pro] Dream auto-promote: ${result.written} written, ${result.skipped} skipped`);
+      }
+    } catch (err) {
+      console.error(`[claude-memory-pro] Dream auto-promote failed: ${err}`);
+    }
+  }, DREAM_INTERVAL_MS);
+  console.error(`[claude-memory-pro] Dream timer: light promotion every 30min`);
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[claude-memory-pro] MCP Server v2.0.0 started");
   console.error(`[claude-memory-pro] DB: ${DB_PATH}, Model: ${EMBEDDING_MODEL}`);
-  console.error("[claude-memory-pro] Features: atlas, habits, capture, cleanup, journal, audit");
+  console.error(`[claude-memory-pro] Features: atlas, habits, capture${autoCapture.isLLMEnabled ? `(LLM:${autoCapture.captureModel})` : '(keyword-only)'}, cleanup, journal, audit, dream`);
 }
 
 main().catch(err => {
   console.error("[claude-memory-pro] Fatal:", err);
   process.exit(1);
 });
+
+// 优雅退出兜底：终端关闭/Ctrl+C 时刷新 habit + dream 状态
+function gracefulShutdown(signal: string) {
+  console.error(`[claude-memory-pro] ${signal} received, flushing state...`);
+  try {
+    // 同步刷新 habit 产物
+    refreshHabitArtifacts();
+    // 更新 dream last-run 标记
+    const { saveLastRunState, loadLastRunState } = require('./dream-manager.js');
+    const state = loadLastRunState();
+    (state as any)._lastSessionEnd = new Date().toISOString();
+    saveLastRunState(state);
+  } catch (err) {
+    console.error(`[claude-memory-pro] Shutdown flush failed: ${err}`);
+  }
+  process.exit(0);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGHUP', () => gracefulShutdown('SIGHUP'));

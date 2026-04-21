@@ -43,6 +43,8 @@ export interface KGEdge {
   weight: number;
 }
 
+export type RouteDimension = 'entity' | 'category' | 'temporal' | 'causal' | 'text' | 'neighbor';
+
 export interface KGQueryResult {
   id: string;
   summary: string;
@@ -50,6 +52,7 @@ export interface KGQueryResult {
   importance: number;
   score: number;
   reason: string;
+  dimensions: RouteDimension[];
   superseded: boolean;
 }
 
@@ -66,14 +69,22 @@ export interface KnowledgeGraphData {
 // ============================================================================
 
 function tokenize(text: string): string[] {
-  return text
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .split(/\s+/)
-    .filter(t => t.length > 1);
+  const normalized = text.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ');
+  const spaceTokens = normalized.split(/\s+/).filter(t => t.length > 1);
+
+  // 对中文字符段落补充 bigram，提升中文 entity 匹配精度
+  const chineseSegments = normalized.match(/[\u4e00-\u9fff]{2,}/g) || [];
+  const bigrams: string[] = [];
+  for (const seg of chineseSegments) {
+    for (let i = 0; i < seg.length - 1; i++) {
+      bigrams.push(seg.slice(i, i + 2));
+    }
+  }
+
+  return [...new Set([...spaceTokens, ...bigrams])];
 }
 
-function textOverlap(a: string, b: string, minJaccard = 0.15): boolean {
+function textOverlap(a: string, b: string, minJaccard = 0.10): boolean {
   const tokensA = new Set(tokenize(a));
   const tokensB = new Set(tokenize(b));
   if (tokensA.size === 0 || tokensB.size === 0) return false;
@@ -315,47 +326,103 @@ export class KnowledgeGraphManager {
     }
   }
 
+  /**
+   * 多维路由查询。
+   * KG 是多维索引，从 entity/category/temporal/causal/text 多个维度
+   * 对同一条记忆做索引，返回候选 ID 及命中维度。
+   * 向量数据库负责后续精排。
+   */
   query(
     rawQuery: string,
     options: { limit?: number; includeSuperseded?: boolean } = {}
   ): KGQueryResult[] {
     const { limit = 10, includeSuperseded = false } = options;
     const queryTokens = new Set(tokenize(rawQuery));
-    const results: KGQueryResult[] = [];
-    const seen = new Set<string>();
 
-    // Strategy 1: entityKey match
+    // 候选收集器：同一 ID 可被多个维度命中，分数和维度累加
+    const candidates = new Map<string, { score: number; dimensions: Set<RouteDimension>; reason: string[] }>();
+
+    const addCandidate = (id: string, score: number, dim: RouteDimension, reason: string) => {
+      const node = this.kg.nodes.get(id);
+      if (!node) return;
+      if (!includeSuperseded && node.superseded) return;
+      const existing = candidates.get(id);
+      if (existing) {
+        existing.score = Math.max(existing.score, score); // 取最高维度分
+        existing.dimensions.add(dim);
+        if (!existing.reason.includes(reason)) existing.reason.push(reason);
+      } else {
+        candidates.set(id, { score, dimensions: new Set([dim]), reason: [reason] });
+      }
+    };
+
+    // === 维度 1：实体匹配（subject） ===
     const queryEntityKey = Array.from(queryTokens).slice(0, 3).join('_');
     for (const id of (this.kg.byEntityKey.get(queryEntityKey) || [])) {
-      if (seen.has(id)) continue;
-      seen.add(id);
-      const node = this.kg.nodes.get(id)!;
-      if (!includeSuperseded && node.superseded) continue;
-      results.push({ id: node.id, summary: node.summary, entityKey: node.entityKey, importance: node.importance, score: 1.0, reason: 'entity_match', superseded: node.superseded });
+      addCandidate(id, 1.0, 'entity', 'entity_key_match');
     }
-
-    // Strategy 2: category match
-    for (const [category, ids] of this.kg.byCategory) {
-      if (!queryTokens.has(category)) continue;
-      for (const id of ids) {
-        if (seen.has(id)) continue;
-        seen.add(id);
-        const node = this.kg.nodes.get(id)!;
-        if (!includeSuperseded && node.superseded) continue;
-        results.push({ id: node.id, summary: node.summary, entityKey: node.entityKey, importance: node.importance, score: 0.7, reason: 'category_match', superseded: node.superseded });
+    // 模糊实体匹配：遍历所有 entityKey，看 token 重叠
+    for (const [ek, ids] of this.kg.byEntityKey) {
+      const ekTokens = new Set(tokenize(ek));
+      let overlap = 0;
+      for (const t of queryTokens) { if (ekTokens.has(t)) overlap++; }
+      if (overlap > 0 && overlap / Math.max(ekTokens.size, 1) >= 0.5) {
+        for (const id of ids) {
+          addCandidate(id, 0.85, 'entity', 'entity_fuzzy');
+        }
       }
     }
 
-    // Strategy 3: text/token overlap
+    // === 维度 2：分类匹配 ===
+    for (const [category, ids] of this.kg.byCategory) {
+      if (!queryTokens.has(category)) continue;
+      for (const id of ids) {
+        addCandidate(id, 0.6, 'category', `category:${category}`);
+      }
+    }
+
+    // === 维度 3：文本/token 重叠 ===
     for (const [id, node] of this.kg.nodes) {
-      if (seen.has(id)) continue;
-      if (!includeSuperseded && node.superseded) continue;
       const nodeTokens = new Set(tokenize(node.summary));
       let overlap = 0;
       for (const t of queryTokens) { if (nodeTokens.has(t)) overlap++; }
       if (overlap === 0) continue;
-      const score = (overlap / Math.max(queryTokens.size, 1)) * 0.6;
-      results.push({ id: node.id, summary: node.summary, entityKey: node.entityKey, importance: node.importance, score, reason: 'text_match', superseded: node.superseded });
+      const score = (overlap / Math.max(queryTokens.size, 1)) * 0.7;
+      if (score >= 0.2) {
+        addCandidate(id, score, 'text', 'text_overlap');
+      }
+    }
+
+    // === 维度 4：邻居扩展（通过 causal/temporal/subject 边） ===
+    // 已命中的节点，沿关系边扩展邻居
+    const directHits = new Set(candidates.keys());
+    for (const edge of this.kg.edges) {
+      if (edge.relation === 'category' || edge.relation === 'contradicts') continue;
+      const dim: RouteDimension = edge.relation === 'temporal' ? 'temporal'
+        : edge.relation === 'causal' ? 'causal' : 'neighbor';
+
+      if (directHits.has(edge.source) && !directHits.has(edge.target)) {
+        addCandidate(edge.target, edge.weight * 0.5, dim, `${edge.relation}_neighbor`);
+      }
+      if (directHits.has(edge.target) && !directHits.has(edge.source)) {
+        addCandidate(edge.source, edge.weight * 0.5, dim, `${edge.relation}_neighbor`);
+      }
+    }
+
+    // 组装结果：多维度命中加权 bonus
+    const results: KGQueryResult[] = [];
+    for (const [id, cand] of candidates) {
+      const node = this.kg.nodes.get(id)!;
+      // 多维度命中 bonus：每多一个维度 +0.1（最多 +0.3）
+      const dimBonus = Math.min((cand.dimensions.size - 1) * 0.1, 0.3);
+      const finalScore = Math.min(cand.score + dimBonus, 1.0);
+      results.push({
+        id: node.id, summary: node.summary, entityKey: node.entityKey,
+        importance: node.importance, score: finalScore,
+        reason: cand.reason.join('+'),
+        dimensions: Array.from(cand.dimensions),
+        superseded: node.superseded,
+      });
     }
 
     results.sort((a, b) => b.score !== a.score ? b.score - a.score : b.importance - a.importance);

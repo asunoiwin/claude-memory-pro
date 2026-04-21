@@ -318,6 +318,33 @@ export class MemoryStore {
     }));
   }
 
+  async getRecallCandidates(limit = 200): Promise<MemoryEntry[]> {
+    const entries = await this.list(undefined, undefined, limit);
+    return entries.filter(e => (e.recallCount ?? 0) > 0);
+  }
+
+  async updateEntrySupersedes(id: string, supersedesId: string): Promise<void> {
+    const entries = await this.getByIds([id]);
+    if (entries.length === 0) return;
+    const entry = entries[0];
+    let meta: Record<string, any> = {};
+    try { if (entry.metadata) meta = JSON.parse(entry.metadata); } catch {}
+    meta.supersededBy = supersedesId;
+    meta.supersededAt = new Date().toISOString();
+    await this.update(id, { metadata: JSON.stringify(meta) });
+  }
+
+  async updateEntryExpired(id: string): Promise<void> {
+    const entries = await this.getByIds([id]);
+    if (entries.length === 0) return;
+    const entry = entries[0];
+    let meta: Record<string, any> = {};
+    try { if (entry.metadata) meta = JSON.parse(entry.metadata); } catch {}
+    meta.expired = true;
+    meta.expiredAt = new Date().toISOString();
+    await this.update(id, { metadata: JSON.stringify(meta) });
+  }
+
   async stats(scopeFilter?: string[]): Promise<{
     totalCount: number;
     scopeCounts: Record<string, number>;

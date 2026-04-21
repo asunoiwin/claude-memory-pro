@@ -11,6 +11,7 @@ const { homedir } = require('node:os');
 const BASE_DIR = join(homedir(), '.claude', 'memory-pro');
 const HABIT_FILE = join(BASE_DIR, 'habit-candidates.json');
 const ROLLUP_FILE = join(BASE_DIR, 'instinct-rollup.md');
+const DREAM_LAST_RUN = join(BASE_DIR, 'dream-last-run.json');
 
 function readJson(path) {
   try {
@@ -74,6 +75,19 @@ function main() {
 
   mkdirSync(dirname(ROLLUP_FILE), { recursive: true });
   writeFileSync(ROLLUP_FILE, lines.join('\n'), 'utf-8');
+
+  // 更新 dream-last-run.json 记录本次会话时间
+  // （实际晋升由 MCP server 启动时的 recoverMissedPhases 和手动 memory_dream run 执行）
+  try {
+    let dreamState = { light: null, deep: null, rem: null };
+    if (existsSync(DREAM_LAST_RUN)) {
+      try { dreamState = JSON.parse(readFileSync(DREAM_LAST_RUN, 'utf8')); } catch {}
+    }
+    // 标记会话活跃时间，便于下次启动判断是否需要恢复
+    dreamState._lastSessionEnd = new Date().toISOString();
+    mkdirSync(dirname(DREAM_LAST_RUN), { recursive: true });
+    writeFileSync(DREAM_LAST_RUN, JSON.stringify(dreamState, null, 2), 'utf8');
+  } catch {}
 }
 
 main();

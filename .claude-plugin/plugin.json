@@ -10,7 +10,8 @@
         "MEMORY_DB_PATH": "${userHome}/.claude/memory-pro/lancedb",
         "EMBEDDING_API_KEY": "sk-ghsldvqimltmwvbpnbsgpxwjkvdtnojvptybqifqyuwniedd",
         "EMBEDDING_BASE_URL": "https://api.siliconflow.cn/v1",
-        "EMBEDDING_MODEL": "BAAI/bge-m3"
+        "EMBEDDING_MODEL": "BAAI/bge-m3",
+        "CAPTURE_MODEL": "Qwen/Qwen2.5-7B-Instruct"
       },
       "userConfig": {
         "EMBEDDING_API_KEY": {
@@ -32,6 +33,11 @@
           "description": "数据库存储路径",
           "required": false,
           "default": "${userHome}/.claude/memory-pro/lancedb"
+        },
+        "CAPTURE_MODEL": {
+          "description": "智能捕获用的 chat 模型（SiliconFlow）",
+          "required": false,
+          "default": "Qwen/Qwen2.5-7B-Instruct"
         }
       }
     }
@@ -44,6 +50,16 @@
             "type": "command",
             "command": "node ${pluginDir}/../scripts/session-start-hook.cjs",
             "statusMessage": "加载语义记忆 + 工作先验..."
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${pluginDir}/../scripts/session-start-hook.cjs",
+            "statusMessage": "上下文压缩后重新注入记忆先验..."
           }
         ]
       }
@@ -76,17 +92,23 @@
     "memory-cleanup": {
       "description": "清理记忆库（去噪、去重、压缩）",
       "prompt": "调用 memory_cleanup 工具清理记忆库，删除噪音、去重和摘要压缩。"
+    },
+    "memory-dream": {
+      "description": "查看或执行 Dream 记忆晋升",
+      "prompt": "调用 memory_dream 工具，先用 action=status 查看 Dream 状态，再根据需要用 action=run 执行晋升或 action=reorg 执行日常整理。"
     }
   },
   "rules": [
-    "【自动回忆】在回答涉及用户偏好、历史决策、项目上下文的问题前，先用 memory_recall 检索相关记忆，将结果作为回答的参考依据。",
+    "【召回链路】memory_recall 以 KG 多维路由为入口（实体/时间/因果/分类），候选经向量精排后返回。KG 为空时回退到纯向量+BM25。在回答涉及用户偏好、历史决策、项目上下文的问题前，先用 memory_recall 检索。",
     "【自动存储】当用户使用"记住"、"记得"、"以后都"、"必须"、"禁止"、"不要"等关键词时，主动使用 memory_store 保存。重要决策和规则的 importance 设为 0.9-1.0。",
     "【自动捕获】当检测到用户表达偏好、做出决策、纠正错误或设定规则时，使用 memory_capture 工具自动分析并存储。",
     "【分类准确】存储时选择准确的 category：preference（偏好）、fact（事实/规则）、decision（决策）、entity（实体/项目）。",
     "【多域隔离】为不同项目使用不同的 scope（如 project:larktokenweb），全局知识用 global。",
     "【知识图谱】当记忆累积到一定数量（>20条）时，建议用户运行 memory_atlas refresh 构建知识图谱，便于发现记忆间的关联。",
-    "【记忆晋升】memory_recall 的每次调用都会自动追踪召回频率。高频召回的记忆会自动晋升（retain→reinforce→promote），promote 级别的记忆会写入 instinct-rollup.md 作为工作先验，在下次会话开始时自动注入。",
+    "【记忆晋升】memory_recall 每次调用自动追踪召回频率（暂存层，不影响召回排序）。高频记忆通过 Dream 三阶段晋升（light→deep→REM），deep/REM 级自动同步到 MEMORY.md 进入系统提示词层。",
     "【去重检查】存储前自动检查向量相似度，>98% 的重复记忆会被跳过。",
-    "【噪音过滤】问候语、系统消息、模板语句会被自动过滤，不会存入记忆。"
+    "【噪音过滤】问候语、系统消息、模板语句会被自动过滤，不会存入记忆。",
+    "【Dream 晋升】记忆通过三阶段晋升（light→deep→REM），基于召回频率和最近性评分。deep/REM 级记忆自动同步到 ~/.claude/projects/*/memory/dream-promoted.md，进入 Claude Code 原生系统提示词。MCP server 启动时自动恢复离线期间错过的晋升，运行期间每30分钟定时执行，也可手动 memory_dream run 触发。",
+    "【日常整理】使用 memory_dream reorg 执行日常整理：重建 Atlas/KG、检测实体碰撞和矛盾、标记过期记忆。"
   ]
 }
