@@ -58,7 +58,7 @@ const auditEngine = new AuditEngine(store);
 const knowledgeGraph = new KnowledgeGraphManager(store);
 setKG(knowledgeGraph);
 
-const CATEGORIES = ["preference", "fact", "decision", "entity", "other"] as const;
+const CATEGORIES = ["preference", "fact", "decision", "entity", "other", "task", "lesson"] as const;
 
 // ============================================================================
 // Helpers
@@ -435,6 +435,9 @@ server.tool(
   async ({ text, category, importance, scope }) => {
     const result = await autoCapture.capture(text, category, importance, { scope });
     if (!result) return { content: [{ type: "text" as const, text: "未触发捕获。" }] };
+    if (result.kind === 'redirect') {
+      return { content: [{ type: "text" as const, text: `⚠️ 已拒绝（${result.redirect}）：${result.hint}` }] };
+    }
     const method = result.llmUsed ? '（LLM 分析）' : '（关键词匹配）';
     return { content: [{ type: "text" as const, text: `已捕获${method}：${result.type}，重要性=${result.importance}` }] };
   }
@@ -603,6 +606,195 @@ server.tool(
       `• 上次 REM：${lastRun.rem || '从未'}`,
     ];
     return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+  }
+);
+
+// ============================================================================
+// 三维扩展：Task / Lesson 专用工具（v2 增强：精确去重 + 阈值控制 + 噪声白名单）
+// ============================================================================
+
+// -- task_create --
+server.tool(
+  "task_create",
+  "创建/更新跨会话持久化任务。同 project 同 subject 未完成任务自动覆盖（不新建）。",
+  {
+    subject: z.string().min(4).describe("任务标题（>=4 字，太短拒绝）"),
+    project: z.string().describe("所属项目（必填，作为 scope 隔离）"),
+    status: z.enum(["pending", "in_progress", "completed", "cancelled"]).default("in_progress"),
+    importance: z.number().min(0).max(1).default(0.7),
+    parentTaskId: z.string().optional().describe("父任务 ID（构建任务依赖树）"),
+    description: z.string().optional().describe("任务详情（可选）"),
+  },
+  async ({ subject, project, status, importance, parentTaskId, description }) => {
+    const scope = `task:${project}`;
+    const text = `[TASK:${status}] ${subject}${description ? " — " + description : ""}`;
+
+    // 精确去重：仅在 open 任务（pending/in_progress）中找同 subject。
+    // 终态（completed/cancelled）保留为历史，不被新调用静默覆盖；
+    // 这样"再次以同名启动一个新任务"会建新条目而非把历史记录改回 in_progress。
+    const existing = (await store.list([scope], "task", 200, 0)).find(e => {
+      try {
+        const m = JSON.parse(e.metadata || "{}");
+        const open = m.status === "pending" || m.status === "in_progress";
+        return open && m.subject === subject;
+      } catch { return false; }
+    });
+
+    if (existing) {
+      const meta = { ...JSON.parse(existing.metadata || "{}"), subject, project, status, parentTaskId, description, type: "task", updatedAt: new Date().toISOString() };
+      await store.update(existing.id, { text, metadata: JSON.stringify(meta) });
+      return { content: [{ type: "text" as const, text: `已更新任务 [${existing.id.slice(0, 8)}]：${subject} → ${status}` }] };
+    }
+
+    const vector = await embedder.embedPassage(text.slice(0, 500));
+    const meta = { subject, project, status, parentTaskId, description, type: "task", createdAt: new Date().toISOString() };
+    const newEntry = await store.store({
+      text: text.slice(0, 500), vector, importance: clamp01(importance), category: "task", scope,
+      metadata: JSON.stringify(meta),
+    });
+    return { content: [{ type: "text" as const, text: `已创建任务 [${newEntry.id.slice(0, 8)}]：${subject}（${status}，project=${project}）` }] };
+  }
+);
+
+// -- task_list --
+server.tool(
+  "task_list",
+  "列出指定项目的任务。按状态过滤，默认只返未完成。",
+  {
+    project: z.string().describe("项目名"),
+    status: z.enum(["pending", "in_progress", "completed", "cancelled", "all", "open"]).default("open").describe("open=pending+in_progress（默认）"),
+    limit: z.number().min(1).max(100).default(30),
+  },
+  async ({ project, status, limit }) => {
+    const scope = `task:${project}`;
+    const all = await store.list([scope], "task", 200, 0);
+    const filtered = all.filter(e => {
+      if (status === "all") return true;
+      try {
+        const s = JSON.parse(e.metadata || "{}").status;
+        if (status === "open") return s === "pending" || s === "in_progress";
+        return s === status;
+      } catch { return false; }
+    }).slice(0, limit);
+    if (filtered.length === 0) return { content: [{ type: "text" as const, text: `项目 ${project} 无 ${status} 任务` }] };
+    const lines = filtered.map((e, i) => {
+      const m = JSON.parse(e.metadata || "{}");
+      return `${i + 1}. [${m.status}] ${m.subject}${m.description ? " — " + m.description : ""} (${e.id.slice(0, 8)})`;
+    });
+    return { content: [{ type: "text" as const, text: `项目 ${project} 任务（${filtered.length}）：\n${lines.join("\n")}` }] };
+  }
+);
+
+// -- lesson_capture --
+server.tool(
+  "lesson_capture",
+  "记录踩过的坑/反模式/避坑教训。同类教训自动合并 evidence（向量阈值 0.85，比 memory 宽松）。",
+  {
+    pitfall: z.string().min(10).describe("踩了什么坑（>=10 字，必须具体）"),
+    solution: z.string().min(5).describe("正确做法/避免方式"),
+    triggerKeywords: z.array(z.string()).min(1).describe("触发关键词（>=1 个，用于下次自动 recall）"),
+    project: z.string().describe("项目名（lesson:project scope）"),
+    evidence: z.string().optional().describe("证据/原因（如错误信息、commit 链接）"),
+    importance: z.number().min(0).max(1).default(0.85).describe("默认 0.85，教训通常很重要"),
+  },
+  async ({ pitfall, solution, triggerKeywords, project, evidence, importance }) => {
+    const scope = `lesson:${project}`;
+    const text = `[LESSON] 坑：${pitfall}\n避坑：${solution}\n触发词：${triggerKeywords.join(", ")}`;
+    const vector = await embedder.embedPassage(text.slice(0, 500));
+
+    // 双信号合并：向量相似度 >= 0.78 OR triggerKeywords 重叠 >=2
+    // 单纯向量 0.85 偏严会让"同教训不同表述"漏合并；关键词重叠是更强的人类语义信号
+    const candidates = await store.vectorSearch(vector, 5, 0.1, [scope]);
+    const newKwSet = new Set(triggerKeywords.map(k => k.toLowerCase()));
+    const matched = candidates
+      .map(c => {
+        const m = JSON.parse(c.entry.metadata || "{}");
+        const oldKw: string[] = m.triggerKeywords || [];
+        const overlap = oldKw.filter(k => newKwSet.has(k.toLowerCase())).length;
+        return { c, overlap };
+      })
+      .filter(x => x.c.score >= 0.78 || x.overlap >= 2)
+      .sort((a, b) => (b.c.score + b.overlap * 0.05) - (a.c.score + a.overlap * 0.05))[0];
+    if (matched) {
+      const similar = [matched.c];
+      const m = JSON.parse(similar[0].entry.metadata || "{}");
+      const mergedKeywords = [...new Set([...(m.triggerKeywords || []), ...triggerKeywords])];
+      const mergedEvidence = [m.lastEvidence, evidence].filter(Boolean).slice(-3);
+      const newMeta = {
+        ...m, pitfall, solution,
+        triggerKeywords: mergedKeywords,
+        evidenceCount: (m.evidenceCount || 1) + 1,
+        lastEvidence: evidence || m.lastEvidence,
+        evidenceHistory: mergedEvidence,
+        lastSeenAt: new Date().toISOString(),
+      };
+      await store.update(similar[0].entry.id, { metadata: JSON.stringify(newMeta), importance: Math.min(1, (similar[0].entry.importance || 0.85) + 0.05) });
+      return { content: [{ type: "text" as const, text: `已合并到已有教训 [${similar[0].entry.id.slice(0, 8)}]（相似度 ${(similar[0].score * 100).toFixed(0)}%）。证据次数：${newMeta.evidenceCount}` }] };
+    }
+
+    const meta = {
+      pitfall, solution, triggerKeywords, evidence, evidenceCount: 1,
+      type: "lesson", project, capturedAt: new Date().toISOString(),
+      // KG entityKey 提取用：避免所有 lesson 因 entry.text 共享 "[LESSON] 坑" 前缀
+      // token 而互相 supersede。pitfall 前 40 字足够独特。
+      factKey: `lesson:${pitfall.slice(0, 40)}`,
+      summary: pitfall.slice(0, 100),
+    };
+    const newEntry = await store.store({
+      text: text.slice(0, 500), vector, importance: clamp01(importance), category: "lesson", scope,
+      metadata: JSON.stringify(meta),
+    });
+
+    // 方案 C：lesson 入 KG，让相关 memory 跨类型路由到（task 不入图）
+    try { const kg = getKG(); if (kg) kg.addNode(newEntry).catch(() => {}); } catch {}
+
+    return { content: [{ type: "text" as const, text: `已记录新教训 [${newEntry.id.slice(0, 8)}]：${pitfall.slice(0, 60)}...` }] };
+  }
+);
+
+// -- lesson_recall --
+server.tool(
+  "lesson_recall",
+  "按关键词召回项目教训。优先返回 triggerKeywords 命中的，其次向量相似。",
+  {
+    keywords: z.array(z.string()).min(1).describe("查询关键词"),
+    project: z.string().optional().describe("项目名，缺省全局搜"),
+    limit: z.number().min(1).max(20).default(5),
+  },
+  async ({ keywords, project, limit }) => {
+    const scope = project ? `lesson:${project}` : undefined;
+    // 先关键词精确命中
+    const candidates = await store.list(scope ? [scope] : undefined, "lesson", 500, 0);
+    const matched = candidates.filter(e => {
+      try {
+        const m = JSON.parse(e.metadata || "{}");
+        const triggers = (m.triggerKeywords || []).map((s: string) => s.toLowerCase());
+        return keywords.some(k => triggers.some((t: string) => t.includes(k.toLowerCase()) || k.toLowerCase().includes(t)));
+      } catch { return false; }
+    }).slice(0, limit);
+
+    if (matched.length === 0) {
+      // 关键词没命中 → 向量召回
+      const query = keywords.join(" ");
+      const vector = await embedder.embedPassage(query);
+      const vec = await store.vectorSearch(vector, limit, 0.5, scope ? [scope] : undefined);
+      const filtered = vec.filter(r => r.entry.category === "lesson");
+      if (filtered.length === 0) return { content: [{ type: "text" as const, text: `无相关教训（关键词：${keywords.join(",")}）` }] };
+      // 方案 C：lesson 召回纳入 habit 频率统计（task 不纳入）
+      try { recordRecallBatch(filtered.map(r => ({ id: r.entry.id, text: r.entry.text, category: r.entry.category }))); } catch {}
+      const lines = filtered.map((r, i) => {
+        const m = JSON.parse(r.entry.metadata || "{}");
+        return `${i + 1}. ${m.pitfall} → ${m.solution} (向量相似 ${(r.score * 100).toFixed(0)}%, 证据${m.evidenceCount}次)`;
+      });
+      return { content: [{ type: "text" as const, text: `教训命中（向量回退，${filtered.length}）：\n${lines.join("\n")}` }] };
+    }
+
+    try { recordRecallBatch(matched.map(e => ({ id: e.id, text: e.text, category: e.category }))); } catch {}
+    const lines = matched.map((e, i) => {
+      const m = JSON.parse(e.metadata || "{}");
+      return `${i + 1}. ${m.pitfall} → ${m.solution} (触发词命中, 证据${m.evidenceCount || 1}次)`;
+    });
+    return { content: [{ type: "text" as const, text: `教训命中（关键词精确，${matched.length}）：\n${lines.join("\n")}` }] };
   }
 );
 

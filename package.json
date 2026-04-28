@@ -35,6 +35,7 @@
   "dependencies": {
     "@lancedb/lancedb": "^0.26.2",
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "apache-arrow": "^18.1.0",
     "openai": "^4.77.0",
     "zod": "^4.3.6"
   },

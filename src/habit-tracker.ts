@@ -153,6 +153,8 @@ function saveStats(stats: Map<string, MemoryRecallStats>): void {
 }
 
 export function recordRecall(memoryId: string, memoryText: string, category: string, timestamp?: string): void {
+  // 方案 C：task 不纳入习惯统计（召回 task 是查进度，不代表它高价值）
+  if (category === 'task') return;
   const now = timestamp || new Date().toISOString();
   const stats = loadStats();
   const existing = stats.get(memoryId);
@@ -179,9 +181,12 @@ export function recordRecall(memoryId: string, memoryText: string, category: str
 
 export function recordRecallBatch(results: Array<{ id: string; text: string; category: string }>): void {
   if (!results || results.length === 0) return;
+  // 方案 C：批量过滤 task；lesson 与其他 category 通过
+  const filtered = results.filter(r => r.category !== 'task');
+  if (filtered.length === 0) return;
   const now = new Date().toISOString();
   const stats = loadStats();
-  for (const result of results) {
+  for (const result of filtered) {
     const existing = stats.get(result.id);
     if (existing) {
       existing.recallCount += 1;

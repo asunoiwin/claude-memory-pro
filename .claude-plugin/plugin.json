@@ -4,7 +4,7 @@
   "description": "语义记忆增强 v2 — LanceDB 向量数据库 + 知识图谱 + 记忆晋升 + 自动捕获 + 自适应检索",
   "mcpServers": {
     "claude-memory-pro": {
-      "command": "node",
+      "command": "/opt/homebrew/bin/node",
       "args": ["${pluginDir}/../dist/mcp-server.js"],
       "env": {
         "MEMORY_DB_PATH": "${userHome}/.claude/memory-pro/lancedb",

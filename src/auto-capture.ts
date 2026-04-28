@@ -47,7 +47,7 @@ export interface CaptureContext {
   recentContext?: string[];
 }
 
-type MemoryCategory = 'preference' | 'fact' | 'decision' | 'entity' | 'other';
+type MemoryCategory = 'preference' | 'fact' | 'decision' | 'entity' | 'other' | 'task' | 'lesson';
 
 // ============================================================================
 // LLM 智能分析
@@ -56,8 +56,8 @@ type MemoryCategory = 'preference' | 'fact' | 'decision' | 'entity' | 'other';
 const CAPTURE_ANALYSIS_PROMPT = `你是记忆分析器。分析用户输入，判断是否包含值得长期记住的信息。
 
 只输出 JSON，不要解释：
-- 如果值得记住：{"capture":true,"type":"preference|fact|decision|entity|context","importance":0.5-1.0,"summary":"一句话摘要（最多100字）"}
-- 如果不值得：{"capture":false}
+- 值得记住：{"capture":true,"type":"preference|fact|decision|entity|context","importance":0.5-1.0,"summary":"一句话摘要（最多100字）"}
+- 不值得 / 应走专用工具：{"capture":false,"reason":"chat|task|lesson|other"}
 
 判断标准：
 - preference: 用户偏好、习惯、风格要求
@@ -65,7 +65,9 @@ const CAPTURE_ANALYSIS_PROMPT = `你是记忆分析器。分析用户输入，�
 - decision: 明确的决定、选择、方案确认
 - entity: 人名、项目名、服务名及其属性
 - context: 对话中产生的技术结论、排查发现、错误原因定位、功能当前状态、尝试过但失败的方案
-- 不记：纯闲聊、问候、重复查询相同结果
+- 不记 reason="chat": 纯闲聊、问候、重复查询相同结果
+- 不记 reason="task": 跨会话进行中工作、待办事项（应由调用方走 task_create，不能塞进 memory）
+- 不记 reason="lesson": 踩坑教训、反模式、避坑经验（应由调用方走 lesson_capture，不能塞进 memory）
 
 用户输入：`;
 
@@ -74,7 +76,23 @@ interface LLMCaptureResult {
   type?: string;
   importance?: number;
   summary?: string;
+  reason?: string;
 }
+
+export interface CaptureRedirect {
+  kind: 'redirect';
+  redirect: 'task_create' | 'lesson_capture';
+  hint: string;
+}
+
+export interface CaptureStored {
+  kind: 'stored';
+  type: string;
+  importance: number;
+  llmUsed: boolean;
+}
+
+export type CaptureResult = CaptureStored | CaptureRedirect;
 
 async function llmAnalyze(
   text: string,
@@ -141,8 +159,11 @@ function normalizeMemoryCategory(category?: string): MemoryCategory {
     case 'preference': return 'preference';
     case 'decision': return 'decision';
     case 'entity': return 'entity';
-    case 'task': case 'rule': case 'correction': case 'fact': return 'fact';
+    case 'rule': case 'correction': case 'fact': return 'fact';
     case 'context': return 'other';
+    // task / lesson 是结构化维度（需 subject/project 或 pitfall/solution/triggerKeywords），
+    // 不能从无结构内容路由进来；若强行传入，降级为 other 并依赖元数据标记。
+    case 'task': case 'lesson': return 'other';
     default: return 'other';
   }
 }
@@ -207,9 +228,19 @@ export class AutoCaptureEngine {
     category?: string,
     importance?: number,
     overrides?: CaptureContext
-  ): Promise<{ type: string; importance: number; llmUsed: boolean } | null> {
+  ): Promise<CaptureResult | null> {
     if (!this.config.enabled || !content?.trim()) return null;
     const normalizedContent = content.trim().slice(0, 5000);
+
+    // 三维边界硬隔离：task/lesson 必须走专用工具，先于噪音过滤判定，避免噪音文本配
+    // category=task/lesson 被静默丢弃而看不到 redirect 提示
+    if (category === 'task') {
+      return { kind: 'redirect', redirect: 'task_create', hint: 'task 内容不进 memory，请改用 task_create(subject, project, status)' };
+    }
+    if (category === 'lesson') {
+      return { kind: 'redirect', redirect: 'lesson_capture', hint: 'lesson 内容不进 memory，请改用 lesson_capture(pitfall, solution, triggerKeywords, project)' };
+    }
+
     if (isCaptureNoise(normalizedContent, overrides?.source || this.context.source)) return null;
 
     const lower = normalizedContent.toLowerCase();
@@ -232,7 +263,7 @@ export class AutoCaptureEngine {
       const memoryText = buildCaptureText(normalizedContent, effectiveContext);
       const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
       await this.store.store({ text: memoryText.slice(0, 500), vector, category: normalizeMemoryCategory(category), importance: imp, scope, metadata: buildMetadata(category, false) });
-      return { type: category, importance: imp, llmUsed: false };
+      return { kind: 'stored', type: category, importance: imp, llmUsed: false };
     }
 
     // 路径 2：关键词快速匹配
@@ -243,7 +274,7 @@ export class AutoCaptureEngine {
           const memoryText = buildCaptureText(normalizedContent, effectiveContext);
           const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
           await this.store.store({ text: memoryText.slice(0, 500), vector, category: normalizeMemoryCategory(type), importance: imp, scope, metadata: buildMetadata(type, false) });
-          return { type, importance: imp, llmUsed: false };
+          return { kind: 'stored', type, importance: imp, llmUsed: false };
         }
       }
     }
@@ -251,6 +282,14 @@ export class AutoCaptureEngine {
     // 路径 3：LLM 智能分析（关键词未命中时）
     if (this.config.llmEnabled && normalizedContent.length >= 20) {
       const analysis = await llmAnalyze(normalizedContent, this.llmApiKey, this.llmBaseURL, this.llmModel);
+      // LLM 判定是 task/lesson 语义 → 回传 redirect 而非静默丢弃
+      if (analysis && !analysis.capture && (analysis.reason === 'task' || analysis.reason === 'lesson')) {
+        const redirect = analysis.reason === 'task' ? 'task_create' : 'lesson_capture';
+        const hint = analysis.reason === 'task'
+          ? 'LLM 判定为任务语义，请改用 task_create(subject, project, status)'
+          : 'LLM 判定为教训语义，请改用 lesson_capture(pitfall, solution, triggerKeywords, project)';
+        return { kind: 'redirect', redirect, hint };
+      }
       if (analysis?.capture && analysis.type && analysis.summary) {
         const imp = analysis.importance ?? 0.7;
         const memoryText = analysis.summary.slice(0, 500);
@@ -261,7 +300,7 @@ export class AutoCaptureEngine {
           importance: imp, scope,
           metadata: buildMetadata(`llm:${analysis.type}`, true),
         });
-        return { type: analysis.type, importance: imp, llmUsed: true };
+        return { kind: 'stored', type: analysis.type, importance: imp, llmUsed: true };
       }
     }
 

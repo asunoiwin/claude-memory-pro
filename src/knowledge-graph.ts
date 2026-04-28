@@ -166,6 +166,9 @@ function extractEntityKey(entry: MemoryEntry): string | null {
   const meta = parseMetadata(entry);
   const structuredKey = normalizeHint(meta.factKey) || normalizeHint(meta.taskKey) || normalizeHint(meta.ruleHint) || normalizeHint(meta.summary);
   if (structuredKey) return structuredKey;
+  // lesson 不走 text token 回退路径：所有 lesson entry.text 共享 "[LESSON] 坑" 前缀，
+  // token 路径会让不同主题的 lesson 互相 supersede。没 factKey 就让它独立存在（无 entityKey 索引）。
+  if (entry.category === 'lesson') return null;
   const tokens = tokenize(entry.text).slice(0, 5);
   if (tokens.length === 0) return null;
   return tokens.slice(0, 3).join('_');
@@ -203,7 +206,9 @@ export class KnowledgeGraphManager {
   }
 
   async build(): Promise<void> {
-    const entries = await this.store.list(undefined, undefined, 10000, 0);
+    const allEntries = await this.store.list(undefined, undefined, 10000, 0);
+    // 方案 C：task 不入图（临时工作流，不属于语义网络）；lesson 通过
+    const entries = allEntries.filter(e => e.category !== 'task');
     this.kg = { nodes: new Map(), byEntityKey: new Map(), byCategory: new Map(), edges: [], builtAt: new Date().toISOString() };
     this.supersededCache.clear();
 
@@ -299,6 +304,8 @@ export class KnowledgeGraphManager {
   }
 
   async addNode(entry: MemoryEntry): Promise<void> {
+    // 方案 C：task 不入图
+    if (entry.category === 'task') return;
     const ek = extractEntityKey(entry);
     const summary = extractSummary(entry);
     const node: KGNode = {

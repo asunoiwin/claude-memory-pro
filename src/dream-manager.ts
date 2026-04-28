@@ -94,6 +94,10 @@ interface DreamEntry {
 
 function memoryEntryToDreamEntry(entry: MemoryEntry): DreamEntry | null {
   if ((entry.recallCount ?? 0) <= 0) return null;
+  // 方案 C：task/lesson 不进 dream 晋升
+  // task 是临时工作流（completed 后语义无召回价值）
+  // lesson 已有 evidenceCount 自合并加权机制，叠 dream 是双重计分
+  if (entry.category === 'task' || entry.category === 'lesson') return null;
   return {
     memoryId: entry.id,
     memoryText: entry.text,
