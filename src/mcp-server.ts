@@ -17,7 +17,7 @@ import { createRetriever, type RetrievalResult } from "./retriever.js";
 import { isNoise } from "./noise-filter.js";
 import { shouldSkipRetrieval } from "./adaptive-retrieval.js";
 import { refreshMemoryAtlas, getMemoryAtlasStatus, getAtlasHintsForQuery } from "./memory-atlas.js";
-import { recordRecallBatch, generateHabitCandidates, buildInstinctContext, getHabitSummary, refreshHabitArtifacts } from "./habit-tracker.js";
+import { recordRecallBatch, generateHabitCandidates, buildInstinctContext, getHabitSummary, refreshHabitArtifacts, removeFromHabits } from "./habit-tracker.js";
 import { AutoCaptureEngine } from "./auto-capture.js";
 import { cleanupStoredMemories } from "./memory-cleaner.js";
 import { CaptureJournal } from "./capture-journal.js";
@@ -225,7 +225,7 @@ server.tool(
     }
 
     const newEntry = await store.store({
-      text: text.slice(0, 500), vector, importance: safeImportance, category, scope,
+      text: text.slice(0, 5000), vector, importance: safeImportance, category, scope,
       metadata: JSON.stringify({ source: "manual_store", storedAt: new Date().toISOString() }),
     });
 
@@ -233,7 +233,7 @@ server.tool(
     const kg = getKG();
     if (kg) kg.addNode(newEntry).catch(() => {});
 
-    const journalEntry = captureJournal.append({ content: text.slice(0, 500), category, importance: safeImportance, context: { source: 'manual_store' } });
+    const journalEntry = captureJournal.append({ content: text.slice(0, 5000), category, importance: safeImportance, context: { source: 'manual_store' } });
     captureJournal.update(journalEntry.id, { status: 'captured' });
 
     return {
@@ -253,6 +253,7 @@ server.tool(
   async ({ query, memoryId }) => {
     if (memoryId) {
       const deleted = await store.delete(memoryId);
+      if (deleted) removeFromHabits(memoryId);
       return { content: [{ type: "text" as const, text: deleted ? `已删除记忆 ${memoryId}` : `未找到记忆 ${memoryId}` }] };
     }
     if (query) {
@@ -261,7 +262,9 @@ server.tool(
         return { content: [{ type: "text" as const, text: "未找到匹配的记忆。" }] };
       }
       if (results.length === 1 && results[0].score > 0.9) {
-        await store.delete(results[0].entry.id);
+        const id = results[0].entry.id;
+        await store.delete(id);
+        removeFromHabits(id);
         return { content: [{ type: "text" as const, text: `已删除：「${results[0].entry.text}」` }] };
       }
       const list = results.map(r => `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}...`).join("\n");
@@ -649,7 +652,7 @@ server.tool(
     const vector = await embedder.embedPassage(text.slice(0, 500));
     const meta = { subject, project, status, parentTaskId, description, type: "task", createdAt: new Date().toISOString() };
     const newEntry = await store.store({
-      text: text.slice(0, 500), vector, importance: clamp01(importance), category: "task", scope,
+      text: text.slice(0, 5000), vector, importance: clamp01(importance), category: "task", scope,
       metadata: JSON.stringify(meta),
     });
     return { content: [{ type: "text" as const, text: `已创建任务 [${newEntry.id.slice(0, 8)}]：${subject}（${status}，project=${project}）` }] };
@@ -741,7 +744,7 @@ server.tool(
       summary: pitfall.slice(0, 100),
     };
     const newEntry = await store.store({
-      text: text.slice(0, 500), vector, importance: clamp01(importance), category: "lesson", scope,
+      text: text.slice(0, 5000), vector, importance: clamp01(importance), category: "lesson", scope,
       metadata: JSON.stringify(meta),
     });
 

@@ -262,7 +262,7 @@ export class AutoCaptureEngine {
       const imp = importance || this.config.importance[category as keyof typeof this.config.importance] || 0.5;
       const memoryText = buildCaptureText(normalizedContent, effectiveContext);
       const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
-      await this.store.store({ text: memoryText.slice(0, 500), vector, category: normalizeMemoryCategory(category), importance: imp, scope, metadata: buildMetadata(category, false) });
+      await this.store.store({ text: memoryText.slice(0, 5000), vector, category: normalizeMemoryCategory(category), importance: imp, scope, metadata: buildMetadata(category, false) });
       return { kind: 'stored', type: category, importance: imp, llmUsed: false };
     }
 
@@ -273,7 +273,7 @@ export class AutoCaptureEngine {
           const imp = this.config.importance[type as keyof typeof this.config.importance] || 0.5;
           const memoryText = buildCaptureText(normalizedContent, effectiveContext);
           const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
-          await this.store.store({ text: memoryText.slice(0, 500), vector, category: normalizeMemoryCategory(type), importance: imp, scope, metadata: buildMetadata(type, false) });
+          await this.store.store({ text: memoryText.slice(0, 5000), vector, category: normalizeMemoryCategory(type), importance: imp, scope, metadata: buildMetadata(type, false) });
           return { kind: 'stored', type, importance: imp, llmUsed: false };
         }
       }
@@ -292,8 +292,8 @@ export class AutoCaptureEngine {
       }
       if (analysis?.capture && analysis.type && analysis.summary) {
         const imp = analysis.importance ?? 0.7;
-        const memoryText = analysis.summary.slice(0, 500);
-        const vector = await this.embedder.embedPassage(memoryText);
+        const memoryText = analysis.summary.slice(0, 5000);
+        const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
         await this.store.store({
           text: memoryText, vector,
           category: normalizeMemoryCategory(analysis.type),
