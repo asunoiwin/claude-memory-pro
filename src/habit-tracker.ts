@@ -17,7 +17,10 @@ export interface MemoryRecallStats {
   firstRecallAt: string;
   lastRecallAt: string;
   recentRecallDays: number[];
+  recentTimestamps?: string[]; // ISO timestamps of recent recalls for accurate velocity
 }
+
+const MAX_RECENT_TIMESTAMPS = 50;
 
 export interface HabitCandidate {
   memoryId: string;
@@ -59,7 +62,14 @@ function loadStats(): Map<string, MemoryRecallStats> {
 function computeVelocity(stats: MemoryRecallStats): number {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - VELOCITY_WINDOW_DAYS);
-  return stats.lastRecallAt >= cutoff.toISOString() ? stats.recallCount : 0;
+  const cutoffStr = cutoff.toISOString();
+  if (stats.recentTimestamps && stats.recentTimestamps.length > 0) {
+    return stats.recentTimestamps.filter(t => t >= cutoffStr).length;
+  }
+  // Legacy fallback: estimate for entries without timestamp tracking
+  if (stats.lastRecallAt < cutoffStr) return 0;
+  const totalDays = Math.max(1, (new Date(stats.lastRecallAt).getTime() - new Date(stats.firstRecallAt).getTime()) / 86400000);
+  return Math.ceil(stats.recallCount * Math.min(1, VELOCITY_WINDOW_DAYS / totalDays));
 }
 
 function determinePromotionTier(stats: MemoryRecallStats, velocity: number): 'retain' | 'reinforce' | 'promote' {
@@ -162,6 +172,7 @@ export function recordRecall(memoryId: string, memoryText: string, category: str
     existing.recallCount += 1;
     existing.lastRecallAt = now;
     existing.memoryText = memoryText;
+    existing.recentTimestamps = [...(existing.recentTimestamps ?? []), now].slice(-MAX_RECENT_TIMESTAMPS);
   } else {
     if (stats.size >= MAX_TRACKED) {
       let oldestId: string | null = null;
@@ -174,6 +185,7 @@ export function recordRecall(memoryId: string, memoryText: string, category: str
     stats.set(memoryId, {
       memoryId, memoryText, category,
       recallCount: 1, firstRecallAt: now, lastRecallAt: now, recentRecallDays: [0],
+      recentTimestamps: [now],
     });
   }
   saveStats(stats);
@@ -192,11 +204,13 @@ export function recordRecallBatch(results: Array<{ id: string; text: string; cat
       existing.recallCount += 1;
       existing.lastRecallAt = now;
       existing.memoryText = result.text;
+      existing.recentTimestamps = [...(existing.recentTimestamps ?? []), now].slice(-MAX_RECENT_TIMESTAMPS);
     } else {
       if (stats.size >= MAX_TRACKED) break;
       stats.set(result.id, {
         memoryId: result.id, memoryText: result.text, category: result.category,
         recallCount: 1, firstRecallAt: now, lastRecallAt: now, recentRecallDays: [0],
+        recentTimestamps: [now],
       });
     }
   }
@@ -242,4 +256,15 @@ export function getHabitSummary(): {
     reinforce: candidates.filter(i => i.promotionTier === 'reinforce').length,
     retain: candidates.filter(i => i.promotionTier === 'retain').length,
   };
+}
+
+// Remove a memory from habit tracking when it's deleted from the store (Bug 2 fix)
+export function removeFromHabits(memoryId: string): void {
+  const stats = loadStats();
+  // Support both full UUID and 8-char prefix
+  const fullId = Array.from(stats.keys()).find(k => k === memoryId || k.startsWith(memoryId));
+  if (fullId) {
+    stats.delete(fullId);
+    saveStats(stats);
+  }
 }
