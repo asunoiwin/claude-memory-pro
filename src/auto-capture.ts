@@ -111,7 +111,7 @@ export async function llmJsonAnalyze<T = Record<string, unknown>>({
   model,
   systemPrompt,
   userPrompt,
-  maxTokens = 1024,
+  maxTokens = 2048,
   timeoutMs = 20000,
 }: LLMJsonRequest): Promise<T | null> {
   if (!apiKey) return null;
@@ -248,8 +248,8 @@ export class AutoCaptureEngine {
 
     // LLM 配置：复用 embedding API key，单独指定 chat model
     this.llmApiKey = process.env.CAPTURE_API_KEY || process.env.EMBEDDING_API_KEY || '';
-    this.llmBaseURL = process.env.CAPTURE_BASE_URL || process.env.EMBEDDING_BASE_URL || 'https://api.siliconflow.cn/v1';
-    this.llmModel = process.env.CAPTURE_MODEL || 'Qwen/Qwen2.5-7B-Instruct';
+    this.llmBaseURL = process.env.CAPTURE_BASE_URL || process.env.EMBEDDING_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4';
+    this.llmModel = process.env.CAPTURE_MODEL || 'glm-4.5-flash';
 
     if (!this.llmApiKey) {
       this.config.llmEnabled = false;

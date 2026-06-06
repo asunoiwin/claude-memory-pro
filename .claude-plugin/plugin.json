@@ -11,7 +11,9 @@
         "EMBEDDING_API_KEY": "sk-ghsldvqimltmwvbpnbsgpxwjkvdtnojvptybqifqyuwniedd",
         "EMBEDDING_BASE_URL": "https://api.siliconflow.cn/v1",
         "EMBEDDING_MODEL": "BAAI/bge-m3",
-        "CAPTURE_MODEL": "Qwen/Qwen2.5-7B-Instruct"
+        "CAPTURE_API_KEY": "361b84a8c2774861bef5bb32affe96bf.hukzn9W4PVTyyzhn",
+        "CAPTURE_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
+        "CAPTURE_MODEL": "glm-4.5-flash"
       },
       "userConfig": {
         "EMBEDDING_API_KEY": {
@@ -34,10 +36,20 @@
           "required": false,
           "default": "${userHome}/.claude/memory-pro/lancedb"
         },
-        "CAPTURE_MODEL": {
-          "description": "智能捕获用的 chat 模型（SiliconFlow）",
+        "CAPTURE_API_KEY": {
+          "description": "判定/捕获/矛盾检测用的 LLM Key（智谱开放平台，与 embedding key 不通用）",
           "required": false,
-          "default": "Qwen/Qwen2.5-7B-Instruct"
+          "sensitive": true
+        },
+        "CAPTURE_BASE_URL": {
+          "description": "判定/捕获 LLM API 地址",
+          "required": false,
+          "default": "https://open.bigmodel.cn/api/paas/v4"
+        },
+        "CAPTURE_MODEL": {
+          "description": "判定/捕获用的 chat 模型（智谱 GLM-4.5-Flash 免费）",
+          "required": false,
+          "default": "glm-4.5-flash"
         }
       }
     }
