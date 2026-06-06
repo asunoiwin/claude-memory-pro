@@ -100,3 +100,16 @@ test("P0: 原子 incrementRecallBatch 计数且不丢行", async () => {
   assert.equal(got.length, 1, "id 唯一");
   assert.equal(got[0].recallCount, 1, "recallCount 应 +1");
 });
+
+test("listAll化: getRecallCandidates 按召回量取 top（不漏老的高频，库已 >500）", async () => {
+  const lo = await store.store({ text: "recall cand low", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
+  const hi = await store.store({ text: "recall cand high", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
+  await store.incrementRecallBatch([lo.id]);
+  await store.incrementRecallBatch([hi.id]);
+  await store.incrementRecallBatch([hi.id]);
+  const cands = await store.getRecallCandidates(50);
+  assert.ok(cands.every(e => (e.recallCount ?? 0) > 0), "只含召回过的");
+  const ids = cands.map(e => e.id);
+  assert.ok(ids.includes(hi.id) && ids.includes(lo.id), "高频记忆都在候选里（不被最新N窗口挡掉）");
+  assert.ok(ids.indexOf(hi.id) < ids.indexOf(lo.id), "按召回量降序：hi 在 lo 前");
+});

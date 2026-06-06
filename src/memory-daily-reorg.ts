@@ -218,7 +218,7 @@ function appendMergeLog(result: ReorgResult, conflicts: ConflictPair[]): void {
 // ============================================================================
 
 interface StoreForReorg {
-  list(scopeFilter?: string[], category?: string, limit?: number, offset?: number): Promise<MemoryEntry[]>;
+  listAll(scopeFilter?: string[], category?: string): Promise<MemoryEntry[]>;
   updateEntrySupersedes(id: string, supersedesId: string): Promise<void>;
   updateEntryExpired(id: string): Promise<void>;
 }
@@ -258,18 +258,8 @@ export async function runDailyReorganization(
     }
   }
 
-  // Step 2: Fetch all entries
-  const allEntries: MemoryEntry[] = [];
-  let offset = 0;
-  const CHUNK = 500;
-  while (true) {
-    const chunk = await store.list(undefined, undefined, CHUNK, offset);
-    if (chunk.length === 0) break;
-    allEntries.push(...(chunk as MemoryEntry[]));
-    offset += CHUNK;
-    if (chunk.length < CHUNK) break;
-    if (allEntries.length > 5000) break;
-  }
+  // Step 2: Fetch all entries（listAll 真分页全量，去掉原假分页+5000硬截致的重复/漏读）
+  const allEntries = await store.listAll();
 
   // Step 3: Group by entityKey
   const groups = groupByEntityKey(allEntries);

@@ -330,32 +330,17 @@ export class MemoryStore {
     limit = 10,
     offset = 0
   ): Promise<MemoryEntry[]> {
-    if (!this.table) return [];
+    // 基于 listAll 真分页（原零向量搜索是假分页，连"最新N条"都不可靠：先取任意窗口再排序）
     const safeLimit = clampInt(limit, 1, 500);
-
-    const conditions: string[] = [];
-    if (scopeFilter && scopeFilter.length > 0) {
-      conditions.push(`(${scopeFilter.map(s => `scope = '${escapeSqlLiteral(s)}'`).join(" OR ")})`);
-    }
-    if (category) {
-      conditions.push(`category = '${escapeSqlLiteral(category)}'`);
-    }
-
-    // Use a zero-vector search to scan entries, then sort by timestamp (newest first)
-    let query = this.table.search(new Array(this.config.vectorDim).fill(0)).limit(safeLimit + offset + 200);
-    if (conditions.length > 0) {
-      query = query.where(conditions.join(" AND "));
-    }
-
-    const results = await query.toArray();
-    // Sort by timestamp descending (newest first) instead of vector distance
-    results.sort((a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0));
-    return results.slice(offset, offset + safeLimit).map(rowToMemoryEntry);
+    const all = await this.listAll(scopeFilter, category);
+    return all.slice(offset, offset + safeLimit);
   }
 
   async getRecallCandidates(limit = 200): Promise<MemoryEntry[]> {
-    const entries = await this.list(undefined, undefined, limit);
-    return entries.filter(e => (e.recallCount ?? 0) > 0);
+    // 全量里按召回次数取 top，而非"最新N条里挑高频"（否则老的高频记忆永进不了候选）
+    const entries = (await this.listAll()).filter(e => (e.recallCount ?? 0) > 0);
+    entries.sort((a, b) => (b.recallCount || 0) - (a.recallCount || 0));
+    return entries.slice(0, clampInt(limit, 1, 5000));
   }
 
   /** 分页捞全量（绕过 list 单页 500 上限），用于 KG/atlas/cleaner 等需完整视图的场景。按时间倒序。 */
@@ -399,10 +384,9 @@ export class MemoryStore {
     scopeCounts: Record<string, number>;
     categoryCounts: Record<string, number>;
   }> {
-    // Scan up to 5000 entries for distribution stats.
     const [totalCount, entries] = await Promise.all([
       this.count(scopeFilter),
-      this.scan(scopeFilter, 5000),
+      this.listAll(scopeFilter),
     ]);
     const scopeCounts: Record<string, number> = {};
     const categoryCounts: Record<string, number> = {};

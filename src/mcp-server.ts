@@ -1171,7 +1171,7 @@ server.tool(
     // 精确去重：仅在 open 任务（pending/in_progress）中找同 subject。
     // 终态（completed/cancelled）保留为历史，不被新调用静默覆盖；
     // 这样"再次以同名启动一个新任务"会建新条目而非把历史记录改回 in_progress。
-    const existing = (await store.list([scope], "task", 200, 0)).find(e => {
+    const existing = (await store.listAll([scope], "task")).find(e => {
       try {
         const m = JSON.parse(e.metadata || "{}");
         const open = m.status === "pending" || m.status === "in_progress";
@@ -1210,7 +1210,7 @@ server.tool(
   },
   async ({ project, status, limit }) => {
     const scope = `task:${project}`;
-    const all = await store.list([scope], "task", 200, 0);
+    const all = await store.listAll([scope], "task");
     const filtered = all.filter(e => {
       if (status === "all") return true;
       try {
@@ -1316,7 +1316,7 @@ server.tool(
   async ({ keywords, project, limit }) => {
     const scope = project ? `lesson:${project}` : undefined;
     // 先关键词精确命中
-    const candidates = await store.list(scope ? [scope] : undefined, "lesson", 500, 0);
+    const candidates = await store.listAll(scope ? [scope] : undefined, "lesson");
     const matched = candidates.filter(e => {
       try {
         const m = JSON.parse(e.metadata || "{}");
