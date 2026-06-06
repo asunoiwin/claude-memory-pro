@@ -796,7 +796,7 @@ server.tool(
     minConfidence: z.number().min(0).max(1).default(0.75).describe("判定为矛盾的最低置信度（默认0.75）"),
     crossScope: z.boolean().default(false).describe("是否允许跨记忆域配对（默认否，只在同域内找）"),
     maxPairs: z.number().min(1).max(2000).default(200).describe("非 dryRun 时最多判定多少对，控制 LLM 成本（默认200）"),
-    judgeModel: z.string().optional().describe("矛盾判定用的 LLM（默认 CAPTURE_MODEL；建议用 72B 级，7B 漏判率高）"),
+    judgeModel: z.string().optional().describe("矛盾判定用的 LLM（默认 CAPTURE_MODEL=GLM-4.5-Flash；7B 级漏判率高，建议用 GLM-4.5-Flash 或更强）"),
     scope: z.string().optional().describe("限定记忆域（可选）"),
   },
   async ({ dryRun, topK, minScore, minConfidence, crossScope, maxPairs, judgeModel, scope }) => {
