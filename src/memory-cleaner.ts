@@ -98,8 +98,9 @@ export async function cleanupStoredMemories(
   embedder: Embedder,
   options: { limit?: number; maxAgeDays?: number } = {}
 ): Promise<{ scanned: number; deleted: number; cleaned: number; deduped: number }> {
-  const limit = Math.max(20, Math.min(500, options.limit ?? 200));
-  const entries = await store.list(undefined, undefined, limit, 0);
+  // 删噪/去重便宜，全量扫（否则老记忆里的噪音和重复永远清不到）；压缩烧 embedding，用 limit 封顶
+  const compressBudget = Math.max(20, Math.min(500, options.limit ?? 200));
+  const entries = await store.listAll();
   const now = Date.now();
   const maxAgeMs = Math.max(1, options.maxAgeDays ?? 90) * 24 * 60 * 60 * 1000;
   const seen = new Map<string, MemoryEntry>();
@@ -127,6 +128,7 @@ export async function cleanupStoredMemories(
     seen.set(dedupeKey, entry);
 
     if (now - (entry.timestamp || 0) > maxAgeMs) continue;
+    if (cleaned >= compressBudget) continue;
 
     const summary = summarizeContextualMemory(entry.text, { maxChars: 420 });
     const normalizedOriginal = normalizeWhitespace(entry.text);

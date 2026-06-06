@@ -363,6 +363,20 @@ export class MemoryStore {
     return entries.filter(e => (e.recallCount ?? 0) > 0);
   }
 
+  /** 分页捞全量（绕过 list 单页 500 上限），用于 KG/atlas/cleaner 等需完整视图的场景。按时间倒序。 */
+  async listAll(scopeFilter?: string[], category?: string): Promise<MemoryEntry[]> {
+    const total = await this.count(scopeFilter);
+    const out: MemoryEntry[] = [];
+    for (let offset = 0; offset < total; offset += 1000) {
+      const batch = await this.scan(scopeFilter, 1000, offset);
+      if (batch.length === 0) break;
+      out.push(...batch);
+    }
+    const filtered = category ? out.filter(e => e.category === category) : out;
+    filtered.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    return filtered;
+  }
+
   async updateEntrySupersedes(id: string, supersedesId: string): Promise<void> {
     const entries = await this.getByIds([id]);
     if (entries.length === 0) return;

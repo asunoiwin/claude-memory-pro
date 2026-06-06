@@ -115,45 +115,57 @@ export async function llmJsonAnalyze<T = Record<string, unknown>>({
   timeoutMs = 20000,
 }: LLMJsonRequest): Promise<T | null> {
   if (!apiKey) return null;
-  let timeout: NodeJS.Timeout | null = null;
-  try {
-    const controller = new AbortController();
-    timeout = setTimeout(() => controller.abort(), timeoutMs);
+  // 失败不再静默吞掉：记录原因 + 对瞬时失败（超时/5xx/429/空content）重试一次（GLM 思考型偶发不收敛）
+  let lastReason = 'unknown';
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    let timeout: NodeJS.Timeout | null = null;
+    try {
+      const controller = new AbortController();
+      timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-    const response = await fetch(`${baseURL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        temperature: 0.1,
-        max_tokens: maxTokens,
-        response_format: { type: 'json_object' },
-      }),
-      signal: controller.signal,
-    });
+      const response = await fetch(`${baseURL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          temperature: 0.1,
+          max_tokens: maxTokens,
+          response_format: { type: 'json_object' },
+        }),
+        signal: controller.signal,
+      });
 
-    if (!response.ok) return null;
+      if (!response.ok) {
+        lastReason = `http_${response.status}`;
+        if (response.status >= 500 || response.status === 429) continue; // 可重试
+        break; // 4xx 等不可重试
+      }
 
-    const data = await response.json() as any;
-    const content = (data?.choices?.[0]?.message?.content || '').trim();
+      const data = await response.json() as any;
+      const finish = data?.choices?.[0]?.finish_reason;
+      const content = (data?.choices?.[0]?.message?.content || '').trim();
+      if (!content) { lastReason = `empty_content(finish=${finish})`; continue; } // 思考吃光预算，重试
 
-    // 提取 JSON（兼容 markdown code block）
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return null;
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) { lastReason = 'no_json'; continue; }
 
-    return JSON.parse(jsonMatch[0]) as T;
-  } catch {
-    return null;
-  } finally {
-    if (timeout) clearTimeout(timeout);
+      try { return JSON.parse(jsonMatch[0]) as T; }
+      catch { lastReason = 'json_parse_error'; continue; }
+    } catch (e: any) {
+      lastReason = e?.name === 'AbortError' ? `timeout(${timeoutMs}ms)` : `fetch_error:${e?.message || e}`;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
   }
+  console.error(`[claude-memory-pro] llmJsonAnalyze 失败(${model}): ${lastReason}`);
+  return null;
 }
 
 async function llmAnalyze(

@@ -400,13 +400,8 @@ export class KnowledgeGraphManager {
   }
 
   async build(): Promise<void> {
-    // store.list 单页上限 500，分页捞全量（否则记忆数 >500 时最老的被静默漏出图谱）
-    const allEntries: MemoryEntry[] = [];
-    for (let offset = 0; ; offset += 500) {
-      const page = await this.store.list(undefined, undefined, 500, offset);
-      allEntries.push(...page);
-      if (page.length < 500) break;
-    }
+    // listAll 分页捞全量（list 单页上限 500，记忆 >500 时最老的会被静默漏出图谱）
+    const allEntries = await this.store.listAll();
     // 方案 C：task 不入图（临时工作流，不属于语义网络）；lesson 通过
     const entries = allEntries.filter(e => e.category !== 'task');
     this.kg = { nodes: new Map(), byEntityKey: new Map(), byCategory: new Map(), edges: [], builtAt: new Date().toISOString() };

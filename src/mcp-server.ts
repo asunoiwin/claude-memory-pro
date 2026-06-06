@@ -987,8 +987,8 @@ server.tool(
   "memory_cleanup",
   "清理记忆：删噪音、去重、摘要压缩。",
   {
-    limit: z.number().min(20).max(500).default(200).describe("扫描上限"),
-    maxAgeDays: z.number().min(1).max(365).default(90).describe("清理范围（天）"),
+    limit: z.number().min(20).max(500).default(200).describe("压缩次数上限（删噪/去重全量扫，压缩烧 embedding 用此封顶）"),
+    maxAgeDays: z.number().min(1).max(365).default(90).describe("压缩范围（天，仅压缩此范围内的新记忆）"),
   },
   async ({ limit, maxAgeDays }) => {
     const r = await cleanupStoredMemories(store, embedder, { limit, maxAgeDays });

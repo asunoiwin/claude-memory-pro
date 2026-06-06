@@ -149,8 +149,8 @@ export function getAtlasHintsForQuery(
   };
 }
 
-export async function refreshMemoryAtlas(store: MemoryStore, limit = 400): Promise<Record<string, unknown>> {
-  const entries = await store.list(undefined, undefined, limit, 0);
+export async function refreshMemoryAtlas(store: MemoryStore): Promise<Record<string, unknown>> {
+  const entries = await store.listAll();
   const categories = new Map<string, number>();
   const sources = new Map<string, number>();
   const anchors: AtlasAnchor[] = [];
