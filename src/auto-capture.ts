@@ -111,8 +111,8 @@ export async function llmJsonAnalyze<T = Record<string, unknown>>({
   model,
   systemPrompt,
   userPrompt,
-  maxTokens = 150,
-  timeoutMs = 8000,
+  maxTokens = 1024,
+  timeoutMs = 20000,
 }: LLMJsonRequest): Promise<T | null> {
   if (!apiKey) return null;
   let timeout: NodeJS.Timeout | null = null;
@@ -134,6 +134,7 @@ export async function llmJsonAnalyze<T = Record<string, unknown>>({
         ],
         temperature: 0.1,
         max_tokens: maxTokens,
+        response_format: { type: 'json_object' },
       }),
       signal: controller.signal,
     });
@@ -167,8 +168,6 @@ async function llmAnalyze(
     model,
     systemPrompt: '你是记忆分析器，只输出 JSON。',
     userPrompt: CAPTURE_ANALYSIS_PROMPT + text.slice(0, 500),
-    maxTokens: 150,
-    timeoutMs: 8000,
   });
 }
 

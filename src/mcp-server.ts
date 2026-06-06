@@ -44,9 +44,11 @@ const EMBEDDING_API_KEY = process.env.EMBEDDING_API_KEY || "";
 const EMBEDDING_BASE_URL = process.env.EMBEDDING_BASE_URL || "https://api.siliconflow.cn/v1";
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "BAAI/bge-m3";
 const EMBEDDING_DIMENSIONS = parseInt(process.env.EMBEDDING_DIMENSIONS || "0") || undefined;
-const CAPTURE_API_KEY = process.env.CAPTURE_API_KEY || EMBEDDING_API_KEY || "";
-const CAPTURE_BASE_URL = process.env.CAPTURE_BASE_URL || EMBEDDING_BASE_URL;
-const CAPTURE_MODEL = process.env.CAPTURE_MODEL || "Qwen/Qwen2.5-7B-Instruct";
+// 判定/捕获 LLM 默认走智谱免费模型 GLM-4.5-Flash（保留思考，靠 response_format 稳定吐 JSON）；
+// key 必须独立配 CAPTURE_API_KEY（智谱与硅基流动 embedding key 不通用）
+const CAPTURE_API_KEY = process.env.CAPTURE_API_KEY || "";
+const CAPTURE_BASE_URL = process.env.CAPTURE_BASE_URL || "https://open.bigmodel.cn/api/paas/v4";
+const CAPTURE_MODEL = process.env.CAPTURE_MODEL || "glm-4.5-flash";
 
 // ============================================================================
 // Initialize Components
@@ -244,8 +246,6 @@ async function classifyFactStance(
       references ? `同组参考（仅用于理解主题，不要求立场一致）：\n${references}` : "同组参考：无",
       `当前记忆：${text.slice(0, 900)}`,
     ].join("\n"),
-    maxTokens: 80,
-    timeoutMs: 8000,
   });
 
   const stance = normalizeLLMStance(result?.stance);
@@ -254,6 +254,28 @@ async function classifyFactStance(
     return null;
   }
   return stance;
+}
+
+type ContradictionVerdict = { sameFact: boolean; contradicts: boolean; confidence: number };
+
+async function classifyContradictionPair(a: MemoryEntry, b: MemoryEntry, model = CAPTURE_MODEL): Promise<ContradictionVerdict | null> {
+  const result = await llmJsonAnalyze<{ sameFact?: boolean; contradicts?: boolean; confidence?: number }>({
+    apiKey: CAPTURE_API_KEY,
+    baseURL: CAPTURE_BASE_URL,
+    model,
+    systemPrompt: "你是记忆矛盾检测器，只输出 JSON。",
+    userPrompt: [
+      "判断记忆 A 与 B 是否在陈述同一对象的同一属性/结论，以及二者是否相互矛盾。",
+      '只输出 JSON：{"sameFact":bool,"contradicts":bool,"confidence":0~1}',
+      "sameFact=true 仅当两条针对同一对象的同一属性/结论；不同主题、互补信息或仅同领域=false。",
+      "contradicts=true 仅当 sameFact 且结论相反（一个肯定一个否定、数值冲突、方案互斥）。",
+      `A：${a.text.slice(0, 700)}`,
+      `B：${b.text.slice(0, 700)}`,
+    ].join("\n"),
+  });
+  if (!result) return null;
+  const confidence = typeof result.confidence === "number" ? Math.max(0, Math.min(1, result.confidence)) : 0;
+  return { sameFact: result.sameFact === true, contradicts: result.contradicts === true, confidence };
 }
 
 async function buildWriteMetadataWithFactStance(
@@ -758,6 +780,99 @@ server.tool(
     }
     if (failedIds.length > 0) {
       lines.push(`• 失败ID：${failedIds.slice(0, 30).map(id => id.slice(0, 8)).join(", ")}${failedIds.length > 30 ? " ..." : ""}`);
+    }
+    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+  }
+);
+
+// -- memory_scan_contradictions --
+server.tool(
+  "memory_scan_contradictions",
+  "用向量近邻召回疑似讲同一事实的记忆对，再用 LLM 判定是否真矛盾。绕开 factKey 精确碰撞死结。dryRun 默认只报告候选规模，不写库。",
+  {
+    dryRun: z.boolean().default(true).describe("true=只报告候选对规模与预计 LLM 次数；false=真调 LLM 判定并列出矛盾对（仍不写库）"),
+    topK: z.number().min(1).max(20).default(8).describe("每条记忆取多少向量近邻（默认8）"),
+    minScore: z.number().min(0).max(1).default(0.62).describe("近邻相似度下限（默认0.62；真矛盾常落在0.62-0.72，设太高会漏）"),
+    minConfidence: z.number().min(0).max(1).default(0.75).describe("判定为矛盾的最低置信度（默认0.75）"),
+    crossScope: z.boolean().default(false).describe("是否允许跨记忆域配对（默认否，只在同域内找）"),
+    maxPairs: z.number().min(1).max(2000).default(200).describe("非 dryRun 时最多判定多少对，控制 LLM 成本（默认200）"),
+    judgeModel: z.string().optional().describe("矛盾判定用的 LLM（默认 CAPTURE_MODEL；建议用 72B 级，7B 漏判率高）"),
+    scope: z.string().optional().describe("限定记忆域（可选）"),
+  },
+  async ({ dryRun, topK, minScore, minConfidence, crossScope, maxPairs, judgeModel, scope }) => {
+    const entries = await scanFactEntries(scope, 500);
+    const byId = new Map(entries.map(e => [e.id, e]));
+
+    const pairKey = (x: string, y: string) => (x < y ? `${x}|${y}` : `${y}|${x}`);
+    const seen = new Set<string>();
+    const candidates: Array<{ a: MemoryEntry; b: MemoryEntry; score: number }> = [];
+
+    for (const entry of entries) {
+      if (!entry.vector || entry.vector.length === 0) continue;
+      const scopeFilter = crossScope ? undefined : [entry.scope];
+      const neighbors = await store.vectorSearch(entry.vector, topK + 1, minScore, scopeFilter);
+      for (const n of neighbors) {
+        if (n.entry.id === entry.id) continue;
+        const other = byId.get(n.entry.id);
+        if (!other) continue;
+        const key = pairKey(entry.id, other.id);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        candidates.push({ a: entry, b: other, score: n.score });
+      }
+    }
+    candidates.sort((x, y) => y.score - x.score);
+
+    const buckets = { high: 0, mid: 0, low: 0 };
+    for (const c of candidates) {
+      if (c.score >= 0.9) buckets.high += 1;
+      else if (c.score >= 0.8) buckets.mid += 1;
+      else buckets.low += 1;
+    }
+
+    const lines: string[] = [
+      `memory_scan_contradictions ${dryRun ? "dryRun" : "执行"} 完成：`,
+      `• scope：${scope || "全部"}${crossScope ? "（跨域配对）" : "（仅同域）"}`,
+      `• 扫描 fact 类记忆：${entries.length}`,
+      `• 向量候选对（去重后）：${candidates.length}`,
+      `• 相似度分布：0.9+ ${buckets.high} / 0.8-0.9 ${buckets.mid} / ${minScore}-0.8 ${buckets.low}`,
+    ];
+
+    if (dryRun) {
+      lines.push(`• 预计 LLM 判定次数：${Math.min(candidates.length, maxPairs)}（上限 ${maxPairs}）`);
+      const preview = candidates.slice(0, 10).map((c, i) =>
+        `  ${i + 1}. [${c.score.toFixed(3)}] ${c.a.scope} | ${c.a.text.slice(0, 40)} ↔ ${c.b.text.slice(0, 40)}`);
+      if (preview.length > 0) lines.push("", "候选对预览（相似度Top10）：", ...preview);
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    }
+
+    if (!hasStanceLLMConfig()) {
+      lines.push("", "⚠️ LLM 未配置（CAPTURE_API_KEY/BASE_URL/MODEL），无法执行判定。");
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    }
+
+    const toJudge = candidates.slice(0, maxPairs);
+    let judged = 0;
+    let failed = 0;
+    const contradictions: Array<{ a: MemoryEntry; b: MemoryEntry; score: number; confidence: number }> = [];
+    for (const c of toJudge) {
+      const verdict = await classifyContradictionPair(c.a, c.b, judgeModel || CAPTURE_MODEL);
+      if (!verdict) { failed += 1; continue; }
+      judged += 1;
+      if (verdict.sameFact && verdict.contradicts && verdict.confidence >= minConfidence) {
+        contradictions.push({ a: c.a, b: c.b, score: c.score, confidence: verdict.confidence });
+      }
+    }
+
+    lines.push(
+      `• 实际 LLM 判定：${judged}（失败 ${failed}）`,
+      `• 确认矛盾对（sameFact 且 contradicts 且置信≥${minConfidence}）：${contradictions.length}`,
+      "（本工具仅验证收益，不写库）",
+    );
+    if (contradictions.length > 0) {
+      const detail = contradictions.slice(0, 20).map((c, i) =>
+        `  ${i + 1}. [置信${c.confidence.toFixed(2)} 相似${c.score.toFixed(2)}]\n     A(${c.a.scope}): ${c.a.text.slice(0, 90)}\n     B(${c.b.scope}): ${c.b.text.slice(0, 90)}`);
+      lines.push("", "矛盾对：", ...detail);
     }
     return { content: [{ type: "text" as const, text: lines.join("\n") }] };
   }
