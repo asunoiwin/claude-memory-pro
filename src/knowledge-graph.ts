@@ -99,7 +99,7 @@ function textOverlap(a: string, b: string, minJaccard = 0.10): boolean {
   return tokenJaccard(a, b) >= minJaccard;
 }
 
-function parseMetadata(entry: MemoryEntry): Record<string, any> {
+export function parseMemoryMetadata(entry: Pick<MemoryEntry, 'metadata'>): Record<string, any> {
   try { return entry.metadata ? JSON.parse(entry.metadata) : {}; } catch { return {}; }
 }
 
@@ -113,7 +113,28 @@ const GENERIC_HINT_TOKENS = new Set([
   'global', 'manual', 'manual_store', 'store', 'memory', 'memories', 'claude',
   'task', 'lesson', 'other', 'source', 'scope', 'system', 'user', 'entry',
   'update', 'updated', 'create', 'created', 'note', 'notes', 'info',
+  'true', 'false', 'null', 'undefined', 'the', 'and', 'or', 'for', 'with',
+  'this', 'that', 'from', 'into', 'use', 'using', 'should', 'must',
+  '记住', '用户', '当前', '这个', '那个', '需要', '应该', '已经', '可以',
 ]);
+
+const FACT_KEY_CATEGORIES = new Set(['decision', 'lesson', 'fact']);
+
+export type MetadataStance = 'affirm' | 'negate' | 'neutral';
+
+export function isFactKeyCategory(category: string): boolean {
+  return FACT_KEY_CATEGORIES.has(category);
+}
+
+export function normalizeFactKey(value: unknown): string | null {
+  const normalized = normalizeHint(value);
+  if (!normalized) return null;
+  return normalized
+    .replace(/[^\p{L}\p{N}:._|/-]+/gu, '_')
+    .replace(/_+/g, '_')
+    .replace(/^[_|:-]+|[_|:-]+$/g, '')
+    .slice(0, 180) || null;
+}
 
 const CAUSAL_TERMS = [
   'because', 'therefore', 'thus', 'caused', 'causes', 'causing', 'cause',
@@ -146,6 +167,95 @@ function addHintList(tokens: Set<string>, value: unknown): void {
   for (const item of value) addHintValue(tokens, item);
 }
 
+function addLimitedHintList(tokens: Set<string>, value: unknown, limit: number): void {
+  if (!Array.isArray(value)) return;
+  for (const item of value) {
+    if (tokens.size >= limit) return;
+    addHintValue(tokens, item);
+  }
+}
+
+function stableFactKey(prefix: string, parts: unknown[]): string | null {
+  const normalizedParts = parts
+    .map(part => normalizeFactKey(part))
+    .filter((part): part is string => typeof part === 'string' && isDiscriminativeHint(part));
+  if (normalizedParts.length === 0) return null;
+  return normalizeFactKey(`${prefix}:${normalizedParts.join('|')}`);
+}
+
+function textKeyTerms(text: string, limit = 5): string[] {
+  const cleaned = text
+    .replace(/\[[^\]]+\]/g, ' ')
+    .replace(/坑[:：]|避坑[:：]|触发词[:：]|用户输入[:：]/g, ' ')
+    .replace(/[^\p{L}\p{N}._:/-]+/gu, ' ');
+  const terms: string[] = [];
+  const addTerm = (value: string) => {
+    const normalized = normalizeFactKey(value);
+    if (!normalized || !isDiscriminativeHint(normalized)) return;
+    if (terms.includes(normalized)) return;
+    terms.push(normalized);
+  };
+
+  for (const match of cleaned.match(/[A-Za-z][A-Za-z0-9_.:/-]{2,}/g) || []) {
+    addTerm(match);
+    if (terms.length >= limit) return terms;
+  }
+  for (const match of cleaned.match(/[\u4e00-\u9fff]{2,12}/g) || []) {
+    addTerm(match);
+    if (terms.length >= limit) return terms;
+  }
+  for (const token of tokenize(cleaned)) {
+    addTerm(token);
+    if (terms.length >= limit) return terms;
+  }
+  return terms;
+}
+
+export function generateFactKeyForMemory(entry: Pick<MemoryEntry, 'text' | 'category' | 'scope' | 'metadata'>): string | null {
+  if (!isFactKeyCategory(entry.category)) return null;
+  const meta = parseMemoryMetadata(entry);
+  const existing = normalizeFactKey(meta.factKey);
+  if (existing) return existing;
+
+  const scopedParts = [
+    meta.project,
+    meta.topic,
+    meta.component,
+    meta.file,
+    meta.symbol,
+    meta.entityKey,
+    meta.ruleHint,
+  ].filter(Boolean);
+  const scopedKey = stableFactKey('fact', scopedParts);
+  if (scopedKey) return scopedKey;
+
+  const listTokens = new Set<string>();
+  addLimitedHintList(listTokens, meta.entities, 4);
+  addLimitedHintList(listTokens, meta.keywords, 4);
+  addLimitedHintList(listTokens, meta.triggerKeywords, 4);
+  const listKey = stableFactKey('terms', Array.from(listTokens).slice(0, 4));
+  if (listKey) return listKey;
+
+  const summaryKey = stableFactKey('summary', textKeyTerms(typeof meta.summary === 'string' ? meta.summary : '', 4));
+  if (summaryKey) return summaryKey;
+
+  const textTerms = textKeyTerms(entry.text, 5);
+  return stableFactKey('text', textTerms);
+}
+
+export function metadataWithFactKey(entry: Pick<MemoryEntry, 'text' | 'category' | 'scope' | 'metadata'>): Record<string, any> {
+  const meta = parseMemoryMetadata(entry);
+  if (!isFactKeyCategory(entry.category) || normalizeFactKey(meta.factKey)) return meta;
+  const factKey = generateFactKeyForMemory(entry);
+  if (!factKey) return meta;
+  return {
+    ...meta,
+    factKey,
+    factKeySource: meta.factKeySource || 'heuristic',
+    factKeyUpdatedAt: meta.factKeyUpdatedAt || new Date().toISOString(),
+  };
+}
+
 function addCausalTerms(tokens: Set<string>, text: string): void {
   const lower = text.toLowerCase();
   for (const term of CAUSAL_TERMS) {
@@ -154,7 +264,7 @@ function addCausalTerms(tokens: Set<string>, text: string): void {
 }
 
 function extractHintTokens(entry: MemoryEntry): string[] {
-  const meta = parseMetadata(entry);
+  const meta = parseMemoryMetadata(entry);
   const tokens = new Set<string>();
   const values = [
     meta.factKey,
@@ -181,10 +291,21 @@ function hasNegationSignal(text: string): boolean {
   return /(错误|撤回|移除|停用|不应该|不再|不参与|删除|禁用|不要|replace|replaced|revert|reverted|withdrawn|removed|deprecated)/i.test(text);
 }
 
-type MemoryStance = 'positive' | 'negative' | 'neutral';
+type MemoryStance = MetadataStance;
+
+function normalizeMetadataStance(value: unknown): MemoryStance | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'affirm' || normalized === 'positive') return 'affirm';
+  if (normalized === 'negate' || normalized === 'negative') return 'negate';
+  if (normalized === 'neutral') return 'neutral';
+  return null;
+}
 
 function inferStructuredStance(entry: MemoryEntry): MemoryStance {
-  const meta = parseMetadata(entry);
+  const meta = parseMemoryMetadata(entry);
+  const metadataStance = normalizeMetadataStance(meta.stance);
+  if (metadataStance) return metadataStance;
   const fragments = [
     entry.text,
     typeof meta.action === 'string' ? meta.action : '',
@@ -192,15 +313,15 @@ function inferStructuredStance(entry: MemoryEntry): MemoryStance {
     typeof meta.ruleHint === 'string' ? meta.ruleHint : '',
   ].filter(Boolean).join(' ');
   if (!fragments) return 'neutral';
-  if (hasNegationSignal(fragments)) return 'negative';
-  if (/(使用|采用|保留|作为|启用|合并|注入|replace with|use |keep |enable |adopt |merge )/i.test(fragments)) return 'positive';
+  if (hasNegationSignal(fragments)) return 'negate';
+  if (/(使用|采用|保留|作为|启用|合并|注入|确认|决定|采纳|replace with|use |keep |enable |adopt |merge )/i.test(fragments)) return 'affirm';
   return 'neutral';
 }
 
 function contradictionStrength(a: MemoryEntry, b: MemoryEntry): number {
-  const metaA = parseMetadata(a);
-  const metaB = parseMetadata(b);
-  const sameFactKey = normalizeHint(metaA.factKey) && normalizeHint(metaA.factKey) === normalizeHint(metaB.factKey);
+  const metaA = parseMemoryMetadata(a);
+  const metaB = parseMemoryMetadata(b);
+  const sameFactKey = normalizeFactKey(metaA.factKey) && normalizeFactKey(metaA.factKey) === normalizeFactKey(metaB.factKey);
   const sameTaskKey = normalizeHint(metaA.taskKey) && normalizeHint(metaA.taskKey) === normalizeHint(metaB.taskKey);
   const sameRuleHint = normalizeHint(metaA.ruleHint) && normalizeHint(metaA.ruleHint) === normalizeHint(metaB.ruleHint);
   if (!sameFactKey && !sameTaskKey) return 0;
@@ -236,8 +357,8 @@ function causalEdgeWeight(a: MemoryEntry, b: MemoryEntry, summaryA: string, summ
 }
 
 function extractEntityKey(entry: MemoryEntry): string | null {
-  const meta = parseMetadata(entry);
-  const structuredKey = normalizeHint(meta.factKey) || normalizeHint(meta.taskKey) || normalizeHint(meta.ruleHint) || normalizeHint(meta.summary);
+  const meta = parseMemoryMetadata(entry);
+  const structuredKey = normalizeFactKey(meta.factKey) || normalizeHint(meta.taskKey) || normalizeHint(meta.ruleHint) || normalizeHint(meta.summary);
   if (structuredKey) return structuredKey;
   // lesson 不走 text token 回退路径：所有 lesson entry.text 共享 "[LESSON] 坑" 前缀，
   // token 路径会让不同主题的 lesson 互相 supersede。没 factKey 就让它独立存在（无 entityKey 索引）。
@@ -325,14 +446,14 @@ export class KnowledgeGraphManager {
         const a = nodeEntries[i], b = nodeEntries[j];
         const entryA = entriesById.get(a.id), entryB = entriesById.get(b.id);
         if (!entryA || !entryB) continue;
-        const metaA = parseMetadata(entryA), metaB = parseMetadata(entryB);
+        const metaA = parseMemoryMetadata(entryA), metaB = parseMemoryMetadata(entryB);
 
         // Subject / entity match
         if (a.entityKey && a.entityKey === b.entityKey) {
           this.kg.edges.push({ source: a.id, target: b.id, relation: 'subject', weight: 0.9 });
         }
 
-        const sameFactKey = normalizeHint(metaA.factKey) && normalizeHint(metaA.factKey) === normalizeHint(metaB.factKey);
+        const sameFactKey = normalizeFactKey(metaA.factKey) && normalizeFactKey(metaA.factKey) === normalizeFactKey(metaB.factKey);
         const sameTaskKey = normalizeHint(metaA.taskKey) && normalizeHint(metaA.taskKey) === normalizeHint(metaB.taskKey);
         if (sameFactKey || sameTaskKey) {
           this.kg.edges.push({ source: a.id, target: b.id, relation: 'subject', weight: 0.85 });

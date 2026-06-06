@@ -11,6 +11,7 @@
 import type { MemoryStore } from './store.js';
 import type { Embedder } from './embedder.js';
 import { summarizeContextualMemory } from './memory-cleaner.js';
+import { metadataWithFactKey } from './knowledge-graph.js';
 
 // ============================================================================
 // Types
@@ -79,6 +80,16 @@ interface LLMCaptureResult {
   reason?: string;
 }
 
+export interface LLMJsonRequest {
+  apiKey: string;
+  baseURL: string;
+  model: string;
+  systemPrompt: string;
+  userPrompt: string;
+  maxTokens?: number;
+  timeoutMs?: number;
+}
+
 export interface CaptureRedirect {
   kind: 'redirect';
   redirect: 'task_create' | 'lesson_capture';
@@ -94,15 +105,20 @@ export interface CaptureStored {
 
 export type CaptureResult = CaptureStored | CaptureRedirect;
 
-async function llmAnalyze(
-  text: string,
-  apiKey: string,
-  baseURL: string,
-  model: string
-): Promise<LLMCaptureResult | null> {
+export async function llmJsonAnalyze<T = Record<string, unknown>>({
+  apiKey,
+  baseURL,
+  model,
+  systemPrompt,
+  userPrompt,
+  maxTokens = 150,
+  timeoutMs = 8000,
+}: LLMJsonRequest): Promise<T | null> {
+  if (!apiKey) return null;
+  let timeout: NodeJS.Timeout | null = null;
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
+    timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     const response = await fetch(`${baseURL}/chat/completions`, {
       method: 'POST',
@@ -113,15 +129,14 @@ async function llmAnalyze(
       body: JSON.stringify({
         model,
         messages: [
-          { role: 'system', content: '你是记忆分析器，只输出 JSON。' },
-          { role: 'user', content: CAPTURE_ANALYSIS_PROMPT + text.slice(0, 500) },
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
         ],
         temperature: 0.1,
-        max_tokens: 150,
+        max_tokens: maxTokens,
       }),
       signal: controller.signal,
     });
-    clearTimeout(timeout);
 
     if (!response.ok) return null;
 
@@ -132,10 +147,29 @@ async function llmAnalyze(
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return null;
 
-    return JSON.parse(jsonMatch[0]) as LLMCaptureResult;
+    return JSON.parse(jsonMatch[0]) as T;
   } catch {
     return null;
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
+}
+
+async function llmAnalyze(
+  text: string,
+  apiKey: string,
+  baseURL: string,
+  model: string
+): Promise<LLMCaptureResult | null> {
+  return llmJsonAnalyze<LLMCaptureResult>({
+    apiKey,
+    baseURL,
+    model,
+    systemPrompt: '你是记忆分析器，只输出 JSON。',
+    userPrompt: CAPTURE_ANALYSIS_PROMPT + text.slice(0, 500),
+    maxTokens: 150,
+    timeoutMs: 8000,
+  });
 }
 
 // ============================================================================
@@ -247,22 +281,28 @@ export class AutoCaptureEngine {
     const effectiveContext = { ...this.context, ...(overrides || {}) };
     const scope = effectiveContext.scope || 'global';
 
-    const buildMetadata = (captureKind: string, llmUsed: boolean) => JSON.stringify({
-      sessionId: effectiveContext.sessionId || 'unknown',
-      taskId: effectiveContext.taskId || null,
-      source: effectiveContext.source || 'auto-capture',
-      actorRole: effectiveContext.actorRole || 'main',
-      captureKind,
-      llmUsed,
-      capturedAt: new Date().toISOString(),
-    });
+    const buildMetadata = (captureKind: string, llmUsed: boolean, textForKey: string, memoryCategory: MemoryCategory) => JSON.stringify(metadataWithFactKey({
+      text: textForKey,
+      category: memoryCategory,
+      scope,
+      metadata: JSON.stringify({
+        sessionId: effectiveContext.sessionId || 'unknown',
+        taskId: effectiveContext.taskId || null,
+        source: effectiveContext.source || 'auto-capture',
+        actorRole: effectiveContext.actorRole || 'main',
+        captureKind,
+        llmUsed,
+        capturedAt: new Date().toISOString(),
+      }),
+    }));
 
     // 路径 1：强制指定 category
     if (category) {
       const imp = importance || this.config.importance[category as keyof typeof this.config.importance] || 0.5;
       const memoryText = buildCaptureText(normalizedContent, effectiveContext);
+      const memoryCategory = normalizeMemoryCategory(category);
       const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
-      await this.store.store({ text: memoryText.slice(0, 5000), vector, category: normalizeMemoryCategory(category), importance: imp, scope, metadata: buildMetadata(category, false) });
+      await this.store.store({ text: memoryText.slice(0, 5000), vector, category: memoryCategory, importance: imp, scope, metadata: buildMetadata(category, false, memoryText, memoryCategory) });
       return { kind: 'stored', type: category, importance: imp, llmUsed: false };
     }
 
@@ -272,8 +312,9 @@ export class AutoCaptureEngine {
         if (lower.includes(pattern.toLowerCase())) {
           const imp = this.config.importance[type as keyof typeof this.config.importance] || 0.5;
           const memoryText = buildCaptureText(normalizedContent, effectiveContext);
+          const memoryCategory = normalizeMemoryCategory(type);
           const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
-          await this.store.store({ text: memoryText.slice(0, 5000), vector, category: normalizeMemoryCategory(type), importance: imp, scope, metadata: buildMetadata(type, false) });
+          await this.store.store({ text: memoryText.slice(0, 5000), vector, category: memoryCategory, importance: imp, scope, metadata: buildMetadata(type, false, memoryText, memoryCategory) });
           return { kind: 'stored', type, importance: imp, llmUsed: false };
         }
       }
@@ -293,12 +334,13 @@ export class AutoCaptureEngine {
       if (analysis?.capture && analysis.type && analysis.summary) {
         const imp = analysis.importance ?? 0.7;
         const memoryText = analysis.summary.slice(0, 5000);
+        const memoryCategory = normalizeMemoryCategory(analysis.type);
         const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
         await this.store.store({
           text: memoryText, vector,
-          category: normalizeMemoryCategory(analysis.type),
+          category: memoryCategory,
           importance: imp, scope,
-          metadata: buildMetadata(`llm:${analysis.type}`, true),
+          metadata: buildMetadata(`llm:${analysis.type}`, true, memoryText, memoryCategory),
         });
         return { kind: 'stored', type: analysis.type, importance: imp, llmUsed: true };
       }

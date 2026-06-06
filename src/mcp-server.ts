@@ -18,11 +18,20 @@ import { isNoise } from "./noise-filter.js";
 import { shouldSkipRetrieval } from "./adaptive-retrieval.js";
 import { refreshMemoryAtlas, getMemoryAtlasStatus, getAtlasHintsForQuery } from "./memory-atlas.js";
 import { recordRecallBatch, generateHabitCandidates, buildInstinctContext, getHabitSummary, refreshHabitArtifacts, removeFromHabits } from "./habit-tracker.js";
-import { AutoCaptureEngine } from "./auto-capture.js";
+import { AutoCaptureEngine, llmJsonAnalyze } from "./auto-capture.js";
 import { cleanupStoredMemories } from "./memory-cleaner.js";
 import { CaptureJournal } from "./capture-journal.js";
 import { AuditEngine } from "./audit.js";
-import { KnowledgeGraphManager, setKG, getKG } from "./knowledge-graph.js";
+import {
+  KnowledgeGraphManager,
+  setKG,
+  getKG,
+  isFactKeyCategory,
+  metadataWithFactKey,
+  normalizeFactKey,
+  parseMemoryMetadata,
+  type MetadataStance,
+} from "./knowledge-graph.js";
 import { promoteMemoriesFromStore, recoverMissedPhases, getDreamStats, readDreamTrail, DEFAULT_CONFIG as DREAM_DEFAULT_CONFIG, type DreamConfig } from "./dream-manager.js";
 import { runDailyReorganization } from "./memory-daily-reorg.js";
 
@@ -35,6 +44,9 @@ const EMBEDDING_API_KEY = process.env.EMBEDDING_API_KEY || "";
 const EMBEDDING_BASE_URL = process.env.EMBEDDING_BASE_URL || "https://api.siliconflow.cn/v1";
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "BAAI/bge-m3";
 const EMBEDDING_DIMENSIONS = parseInt(process.env.EMBEDDING_DIMENSIONS || "0") || undefined;
+const CAPTURE_API_KEY = process.env.CAPTURE_API_KEY || EMBEDDING_API_KEY || "";
+const CAPTURE_BASE_URL = process.env.CAPTURE_BASE_URL || EMBEDDING_BASE_URL;
+const CAPTURE_MODEL = process.env.CAPTURE_MODEL || "Qwen/Qwen2.5-7B-Instruct";
 
 // ============================================================================
 // Initialize Components
@@ -162,6 +174,120 @@ async function scanVectorHealth(scope?: string, pageSize = 500): Promise<VectorH
   return finalizeVectorHealth(health);
 }
 
+function normalizeLLMStance(value: unknown): MetadataStance | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "affirm" || normalized === "positive") return "affirm";
+  if (normalized === "negate" || normalized === "negative") return "negate";
+  if (normalized === "neutral") return "neutral";
+  return null;
+}
+
+function hasStanceLLMConfig(): boolean {
+  return Boolean(CAPTURE_API_KEY && CAPTURE_BASE_URL && CAPTURE_MODEL);
+}
+
+async function scanFactEntries(scope?: string, pageSize = 500): Promise<MemoryEntry[]> {
+  const scopeFilter = scope ? [scope] : undefined;
+  const totalRows = await store.count(scopeFilter);
+  const safePageSize = clampInt(pageSize, 1, 1000);
+  const entries: MemoryEntry[] = [];
+  for (let offset = 0; offset < totalRows; offset += safePageSize) {
+    const batch = await store.scan(scopeFilter, safePageSize, offset);
+    if (batch.length === 0) break;
+    for (const entry of batch) {
+      if (isFactKeyCategory(entry.category)) entries.push(entry);
+    }
+  }
+  return entries;
+}
+
+async function findEntriesByFactKey(factKey: string, options: { scope?: string; excludeId?: string } = {}): Promise<MemoryEntry[]> {
+  const target = normalizeFactKey(factKey);
+  if (!target) return [];
+  const entries = await scanFactEntries(options.scope, 500);
+  return entries.filter(entry => {
+    if (options.excludeId && entry.id === options.excludeId) return false;
+    const meta = parseMemoryMetadata(entry);
+    return normalizeFactKey(meta.factKey) === target;
+  });
+}
+
+async function classifyFactStance(
+  text: string,
+  factKey: string,
+  peers: MemoryEntry[]
+): Promise<MetadataStance | null> {
+  if (!hasStanceLLMConfig()) {
+    console.error("[claude-memory-pro] stance LLM 未配置，跳过 metadata.stance 判定");
+    return null;
+  }
+
+  const references = peers.slice(0, 5).map((entry, index) => {
+    const meta = parseMemoryMetadata(entry);
+    const stance = typeof meta.stance === "string" ? ` stance=${meta.stance}` : "";
+    return `${index + 1}. [${entry.category}:${entry.scope}${stance}] ${entry.text.slice(0, 220)}`;
+  }).join("\n");
+
+  const result = await llmJsonAnalyze<{ stance?: string }>({
+    apiKey: CAPTURE_API_KEY,
+    baseURL: CAPTURE_BASE_URL,
+    model: CAPTURE_MODEL,
+    systemPrompt: "你是事实立场分类器，只输出 JSON。",
+    userPrompt: [
+      "判断“当前记忆”对同一 factKey 所描述事实的立场。",
+      "只输出 JSON：{\"stance\":\"affirm|negate|neutral\"}",
+      "affirm=肯定/确认/采纳/启用/保留该事实或方案成立。",
+      "negate=否定/撤回/废弃/推翻/禁用/说明该事实或方案不再成立。",
+      "neutral=只是背景、过程、疑问、证据不足或无法判断。",
+      `factKey: ${factKey}`,
+      references ? `同组参考（仅用于理解主题，不要求立场一致）：\n${references}` : "同组参考：无",
+      `当前记忆：${text.slice(0, 900)}`,
+    ].join("\n"),
+    maxTokens: 80,
+    timeoutMs: 8000,
+  });
+
+  const stance = normalizeLLMStance(result?.stance);
+  if (!stance) {
+    console.error(`[claude-memory-pro] stance LLM 判定失败或输出非法，factKey=${factKey}`);
+    return null;
+  }
+  return stance;
+}
+
+async function buildWriteMetadataWithFactStance(
+  text: string,
+  category: MemoryEntry["category"],
+  scope: string,
+  metadata: Record<string, any>,
+  options: { excludeId?: string; collisionScope?: string } = {}
+): Promise<Record<string, any>> {
+  const withFactKey = metadataWithFactKey({
+    text,
+    category,
+    scope,
+    metadata: JSON.stringify(metadata),
+  });
+  const factKey = normalizeFactKey(withFactKey.factKey);
+  if (!factKey) return withFactKey;
+
+  const peers = await findEntriesByFactKey(factKey, {
+    scope: options.collisionScope,
+    excludeId: options.excludeId,
+  });
+  if (peers.length === 0) return withFactKey;
+
+  const stance = await classifyFactStance(text, factKey, peers);
+  if (!stance) return withFactKey;
+  return {
+    ...withFactKey,
+    stance,
+    stanceSource: "llm",
+    stanceUpdatedAt: new Date().toISOString(),
+  };
+}
+
 // ============================================================================
 // MCP Server
 // ============================================================================
@@ -275,9 +401,16 @@ server.tool(
       };
     }
 
+    const metadata = await buildWriteMetadataWithFactStance(
+      text.slice(0, 5000),
+      category,
+      scope,
+      { source: "manual_store", storedAt: new Date().toISOString() }
+    );
+
     const newEntry = await store.store({
       text: text.slice(0, 5000), vector, importance: safeImportance, category, scope,
-      metadata: JSON.stringify({ source: "manual_store", storedAt: new Date().toISOString() }),
+      metadata: JSON.stringify(metadata),
     });
 
     // 增量更新 KG
@@ -347,6 +480,21 @@ server.tool(
     }
     if (importance !== undefined) updates.importance = clamp01(importance);
     if (category) updates.category = category;
+    if (text || category) {
+      const existing = (await store.getByIds([memoryId]))[0];
+      if (existing) {
+        const nextText = text || existing.text;
+        const nextCategory = category || existing.category;
+        const nextMeta = await buildWriteMetadataWithFactStance(
+          nextText,
+          nextCategory,
+          existing.scope,
+          parseMemoryMetadata(existing),
+          { excludeId: existing.id }
+        );
+        updates.metadata = JSON.stringify(nextMeta);
+      }
+    }
     const updated = await store.update(memoryId, updates);
     if (!updated) return { content: [{ type: "text" as const, text: `未找到记忆 ${memoryId}` }] };
     return { content: [{ type: "text" as const, text: `已更新 ${updated.id.slice(0, 8)}：「${updated.text.slice(0, 80)}」` }] };
@@ -471,6 +619,145 @@ server.tool(
     ];
     if (failedIds.length > 0) {
       lines.push(`• 失败ID：${failedIds.slice(0, 20).map(id => id.slice(0, 8)).join(", ")}${failedIds.length > 20 ? " ..." : ""}`);
+    }
+    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+  }
+);
+
+// -- memory_backfill_facts --
+server.tool(
+  "memory_backfill_facts",
+  "为存量 decision/lesson/fact 记忆回填 metadata.factKey；同 factKey 分组成员>=2 时用轻量 LLM 回填 metadata.stance。dryRun 默认只报告。",
+  {
+    dryRun: z.boolean().default(true).describe("true=只报告分组和预计 LLM 调用；false=写回 factKey/stance"),
+    batchSize: z.number().min(1).max(500).default(50).describe("扫描和回填批大小（默认50）"),
+    scope: z.string().optional().describe("限定记忆域（可选）"),
+  },
+  async ({ dryRun, batchSize, scope }) => {
+    const safeBatchSize = clampInt(batchSize, 1, 500);
+    const entries = await scanFactEntries(scope, safeBatchSize);
+    const plans: Array<{ entry: MemoryEntry; meta: Record<string, any>; factKey: string; hadFactKey: boolean }> = [];
+    let noFactKey = 0;
+    let generatedFactKey = 0;
+
+    for (const entry of entries) {
+      const before = parseMemoryMetadata(entry);
+      const hadFactKey = Boolean(normalizeFactKey(before.factKey));
+      const meta = metadataWithFactKey(entry);
+      const factKey = normalizeFactKey(meta.factKey);
+      if (!factKey) {
+        noFactKey += 1;
+        continue;
+      }
+      if (!hadFactKey) generatedFactKey += 1;
+      plans.push({ entry, meta, factKey, hadFactKey });
+    }
+
+    const groups = new Map<string, Array<{ entry: MemoryEntry; meta: Record<string, any>; factKey: string; hadFactKey: boolean }>>();
+    for (const plan of plans) {
+      if (!groups.has(plan.factKey)) groups.set(plan.factKey, []);
+      groups.get(plan.factKey)!.push(plan);
+    }
+    const collisionGroups = Array.from(groups.entries()).filter(([, members]) => members.length >= 2);
+    const llmCallCount = collisionGroups.reduce((sum, [, members]) => sum + members.length, 0);
+    const previewGroups = collisionGroups
+      .sort((a, b) => b[1].length - a[1].length)
+      .slice(0, 10)
+      .map(([factKey, members]) => `  • ${factKey}：${members.length} 条`);
+
+    let factKeyWritten = 0;
+    let stanceWritten = 0;
+    let stanceSkipped = 0;
+    let failed = 0;
+    const failedIds: string[] = [];
+
+    if (!dryRun) {
+      for (let i = 0; i < plans.length; i += safeBatchSize) {
+        const batch = plans.slice(i, i + safeBatchSize);
+        for (const plan of batch) {
+          if (plan.hadFactKey) continue;
+          try {
+            const updated = await store.update(plan.entry.id, { metadata: JSON.stringify(plan.meta) });
+            if (updated) {
+              factKeyWritten += 1;
+            } else {
+              failed += 1;
+              failedIds.push(plan.entry.id);
+            }
+          } catch (error) {
+            console.error(`[claude-memory-pro] factKey 回填失败 id=${plan.entry.id}:`, error instanceof Error ? error.message : String(error));
+            failed += 1;
+            failedIds.push(plan.entry.id);
+          }
+        }
+      }
+
+      if (!hasStanceLLMConfig() && llmCallCount > 0) {
+        console.error("[claude-memory-pro] stance LLM 未配置，跳过所有 metadata.stance 回填");
+        stanceSkipped = llmCallCount;
+      } else {
+        for (const [, members] of collisionGroups) {
+          for (const member of members) {
+            const peers = members.filter(other => other.entry.id !== member.entry.id).map(other => other.entry);
+            const stance = await classifyFactStance(member.entry.text, member.factKey, peers);
+            if (!stance) {
+              failed += 1;
+              failedIds.push(member.entry.id);
+              continue;
+            }
+            const nextMeta = {
+              ...member.meta,
+              stance,
+              stanceSource: "llm",
+              stanceUpdatedAt: new Date().toISOString(),
+            };
+            try {
+              const updated = await store.update(member.entry.id, { metadata: JSON.stringify(nextMeta) });
+              if (updated) {
+                stanceWritten += 1;
+              } else {
+                failed += 1;
+                failedIds.push(member.entry.id);
+              }
+            } catch (error) {
+              console.error(`[claude-memory-pro] stance 回填失败 id=${member.entry.id}:`, error instanceof Error ? error.message : String(error));
+              failed += 1;
+              failedIds.push(member.entry.id);
+            }
+          }
+        }
+      }
+
+      const kg = getKG();
+      if (kg) {
+        try {
+          await kg.build();
+        } catch (error) {
+          console.error("[claude-memory-pro] fact 回填后 KG 重建失败:", error instanceof Error ? error.message : String(error));
+        }
+      }
+    }
+
+    const lines = [
+      `memory_backfill_facts ${dryRun ? "dryRun" : "执行"} 完成：`,
+      `• scope：${scope || "全部"}`,
+      `• 扫描 decision/lesson/fact：${entries.length}`,
+      `• 可用 factKey：${plans.length}`,
+      `• 规则新生成 factKey：${generatedFactKey}`,
+      `• 无法生成 factKey：${noFactKey}`,
+      `• factKey 分组：${groups.size}`,
+      `• 碰撞分组（成员>=2）：${collisionGroups.length}`,
+      `• 预计/实际 stance LLM 调用：${llmCallCount}`,
+      `• 本次写入 factKey：${factKeyWritten}`,
+      `• 本次写入 stance：${stanceWritten}`,
+      `• stance 跳过：${stanceSkipped}`,
+      `• 失败数：${failed}`,
+    ];
+    if (previewGroups.length > 0) {
+      lines.push("", "碰撞分组预览：", ...previewGroups);
+    }
+    if (failedIds.length > 0) {
+      lines.push(`• 失败ID：${failedIds.slice(0, 30).map(id => id.slice(0, 8)).join(", ")}${failedIds.length > 30 ? " ..." : ""}`);
     }
     return { content: [{ type: "text" as const, text: lines.join("\n") }] };
   }
@@ -847,7 +1134,7 @@ server.tool(
       const m = JSON.parse(similar[0].entry.metadata || "{}");
       const mergedKeywords = [...new Set([...(m.triggerKeywords || []), ...triggerKeywords])];
       const mergedEvidence = [m.lastEvidence, evidence].filter(Boolean).slice(-3);
-      const newMeta = {
+      const newMetaBase = {
         ...m, pitfall, solution,
         triggerKeywords: mergedKeywords,
         evidenceCount: (m.evidenceCount || 1) + 1,
@@ -855,18 +1142,27 @@ server.tool(
         evidenceHistory: mergedEvidence,
         lastSeenAt: new Date().toISOString(),
       };
+      const newMeta = metadataWithFactKey({
+        text,
+        category: "lesson",
+        scope,
+        metadata: JSON.stringify(newMetaBase),
+      });
       await store.update(similar[0].entry.id, { metadata: JSON.stringify(newMeta), importance: Math.min(1, (similar[0].entry.importance || 0.85) + 0.05) });
       return { content: [{ type: "text" as const, text: `已合并到已有教训 [${similar[0].entry.id.slice(0, 8)}]（相似度 ${(similar[0].score * 100).toFixed(0)}%）。证据次数：${newMeta.evidenceCount}` }] };
     }
 
-    const meta = {
+    const metaBase = {
       pitfall, solution, triggerKeywords, evidence, evidenceCount: 1,
       type: "lesson", project, capturedAt: new Date().toISOString(),
-      // KG entityKey 提取用：避免所有 lesson 因 entry.text 共享 "[LESSON] 坑" 前缀
-      // token 而互相 supersede。pitfall 前 40 字足够独特。
-      factKey: `lesson:${pitfall.slice(0, 40)}`,
       summary: pitfall.slice(0, 100),
     };
+    const meta = await buildWriteMetadataWithFactStance(
+      text.slice(0, 5000),
+      "lesson",
+      scope,
+      metaBase
+    );
     const newEntry = await store.store({
       text: text.slice(0, 5000), vector, importance: clamp01(importance), category: "lesson", scope,
       metadata: JSON.stringify(meta),
