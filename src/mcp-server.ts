@@ -340,6 +340,7 @@ server.tool(
 
     // === 主路径：KG 多维路由 → 向量精排 ===
     const kg = getKG();
+    if (kg) await kg.ensureFresh(); // store 变更（含其它会话进程的写）则重建，避免陈旧/缺新
     if (kg && kg.getStats().totalNodes > 0) {
       const kgCandidates = kg.query(query, { limit: limit * 4 });
 

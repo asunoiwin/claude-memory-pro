@@ -392,11 +392,18 @@ export class KnowledgeGraphManager {
   private kg: KnowledgeGraphData;
   private store: MemoryStore;
   private supersededCache: Map<string, string>;
+  private builtVersion = -1;
 
   constructor(store: MemoryStore) {
     this.store = store;
     this.kg = { nodes: new Map(), byEntityKey: new Map(), byCategory: new Map(), edges: [], builtAt: null };
     this.supersededCache = new Map();
+  }
+
+  /** 召回前调用：store 版本变了（含其它进程的写）就重建，避免拿陈旧/缺新的图谱 */
+  async ensureFresh(): Promise<void> {
+    const v = await this.store.version();
+    if (v !== this.builtVersion) await this.build();
   }
 
   async build(): Promise<void> {
@@ -504,6 +511,8 @@ export class KnowledgeGraphManager {
       const node = this.kg.nodes.get(oldId);
       if (node) node.superseded = true;
     }
+
+    this.builtVersion = await this.store.version();
   }
 
   async addNode(entry: MemoryEntry): Promise<void> {

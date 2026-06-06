@@ -102,6 +102,19 @@ test("P0: 原子 incrementRecallBatch 计数且不丢行", async () => {
   assert.equal(got[0].recallCount, 1, "recallCount 应 +1");
 });
 
+test("P2: ensureFresh 在 store 变更后自动重建（修跨进程/写后陈旧）", async () => {
+  const kg = new KnowledgeGraphManager(store);
+  await kg.build();
+  const n0 = kg.getStats().totalNodes;
+  // 模拟"另一个进程/写库后未刷新"：直接写库，不手动 build/addNode
+  await store.store({ text: "ensurefresh brand new entry zzz", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
+  await kg.ensureFresh();
+  assert.equal(kg.getStats().totalNodes, n0 + 1, "store 变更后 ensureFresh 应重建并纳入新记忆");
+  // 版本未变则不重复重建（幂等）
+  await kg.ensureFresh();
+  assert.equal(kg.getStats().totalNodes, n0 + 1, "版本未变不应再增");
+});
+
 test("P2: 中文矛盾能被简易检测到（字符bigram，非空格分词）", () => {
   // 同主题中文、含否定对，相似度需够高才判矛盾
   assert.equal(detectSimpleContradiction("计费用 Lago 引擎不要自建", "计费用 Lago 引擎要自建"), true, "中文否定对应检测出矛盾");

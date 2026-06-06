@@ -287,6 +287,12 @@ export class MemoryStore {
     return updated;
   }
 
+  /** LanceDB 表版本号，每次写（add/update/delete）自增；用于跨进程检测图谱是否陈旧 */
+  async version(): Promise<number> {
+    if (!this.table) return 0;
+    try { return await this.table.version(); } catch { return 0; }
+  }
+
   async count(scopeFilter?: string[]): Promise<number> {
     if (!this.table) return 0;
     if (!scopeFilter || scopeFilter.length === 0) return await this.table.countRows();

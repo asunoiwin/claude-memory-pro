@@ -264,17 +264,6 @@ export async function runDailyReorganization(
     }
   }
 
-  // Step 1b: Rebuild KG
-  let kgRebuilt = false;
-  if (kgBuildFn) {
-    try {
-      await kgBuildFn();
-      kgRebuilt = true;
-    } catch (error) {
-      console.warn('[daily-reorg] KG rebuild failed:', error instanceof Error ? error.message : String(error));
-    }
-  }
-
   // Step 2: Fetch all entries（listAll 真分页全量，去掉原假分页+5000硬截致的重复/漏读）
   const allEntries = await store.listAll();
 
@@ -288,6 +277,17 @@ export async function runDailyReorganization(
   const expiredIds = findExpiredMemories(allEntries);
   for (const id of expiredIds) {
     try { await store.updateEntryExpired(id); } catch {}
+  }
+
+  // Step 5b: Rebuild KG（放在取代/过期写库之后，确保本轮裁定当轮就进图谱）
+  let kgRebuilt = false;
+  if (kgBuildFn) {
+    try {
+      await kgBuildFn();
+      kgRebuilt = true;
+    } catch (error) {
+      console.warn('[daily-reorg] KG rebuild failed:', error instanceof Error ? error.message : String(error));
+    }
   }
 
   // Step 6: Log
