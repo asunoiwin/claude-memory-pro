@@ -86,7 +86,8 @@ export function isMemoryNoise(text: string, source?: string): boolean {
 }
 
 function buildDedupeKey(entry: MemoryEntry): string {
-  return normalizeWhitespace(entry.text).toLowerCase().slice(0, 220);
+  // 用全文（仅去重完全相同的内容）；原来只比前220字符会误删"开头雷同的不同长文"
+  return normalizeWhitespace(entry.text).toLowerCase();
 }
 
 function parseMetadata(raw?: string): Record<string, unknown> {

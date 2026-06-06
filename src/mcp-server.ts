@@ -1277,7 +1277,7 @@ server.tool(
         scope,
         metadata: JSON.stringify(newMetaBase),
       });
-      await store.update(similar[0].entry.id, { metadata: JSON.stringify(newMeta), importance: Math.min(1, (similar[0].entry.importance || 0.85) + 0.05) });
+      await store.update(similar[0].entry.id, { text, vector, metadata: JSON.stringify(newMeta), importance: Math.min(1, (similar[0].entry.importance || 0.85) + 0.05) });
       return { content: [{ type: "text" as const, text: `已合并到已有教训 [${similar[0].entry.id.slice(0, 8)}]（相似度 ${(similar[0].score * 100).toFixed(0)}%）。证据次数：${newMeta.evidenceCount}` }] };
     }
 

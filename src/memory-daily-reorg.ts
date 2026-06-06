@@ -104,15 +104,25 @@ function groupByEntityKey(entries: MemoryEntry[]): EntityGroup[] {
 // 简易矛盾检测（基于文本相似度，无需外部 LLM）
 // ============================================================================
 
-function jaccard(a: string, b: string): number {
-  const setA = new Set(a.toLowerCase().split(/\s+/));
-  const setB = new Set(b.toLowerCase().split(/\s+/));
-  const intersection = new Set([...setA].filter(x => setB.has(x)));
-  const union = new Set([...setA, ...setB]);
-  return union.size > 0 ? intersection.size / union.size : 0;
+// 字符 2-gram：中文无空格，按空格分词会把整句当一个 token 致相似度恒为0
+function charBigrams(s: string): Set<string> {
+  const t = s.toLowerCase().replace(/\s+/g, '');
+  const grams = new Set<string>();
+  if (t.length === 1) { grams.add(t); return grams; }
+  for (let i = 0; i < t.length - 1; i++) grams.add(t.slice(i, i + 2));
+  return grams;
 }
 
-function detectSimpleContradiction(newer: string, older: string): boolean {
+function jaccard(a: string, b: string): number {
+  const setA = charBigrams(a), setB = charBigrams(b);
+  if (setA.size === 0 || setB.size === 0) return 0;
+  let inter = 0;
+  for (const g of setA) if (setB.has(g)) inter++;
+  const union = setA.size + setB.size - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+export function detectSimpleContradiction(newer: string, older: string): boolean {
   const negationPairs = [
     [/不[要用能]/, /[要用能]/],
     [/禁止/, /允许/],
@@ -146,21 +156,26 @@ async function processEntityGroups(
   for (const group of groups) {
     if (group.memories.length < 2) continue;
 
-    const [newest, ...older] = group.memories;
-
-    for (const oldEntry of older) {
-      if (detectSimpleContradiction(newest.text, oldEntry.text)) {
-        contradictions++;
-        group.conflicts.push({
-          newerId: newest.id,
-          olderId: oldEntry.id,
-          newerText: newest.text,
-          olderText: oldEntry.text,
-          resolution: 'superseded',
-          reason: '文本矛盾检测：newer-wins',
-        });
-        await store.updateEntrySupersedes(oldEntry.id, newest.id);
-        superseded++;
+    // 组内按时间降序，两两比对（不止"最新 vs 各较旧"，旧记忆之间的矛盾也要抓）
+    const mems = group.memories;
+    for (let j = 1; j < mems.length; j++) {
+      const older = mems[j];
+      for (let i = 0; i < j; i++) {
+        const newer = mems[i];
+        if (detectSimpleContradiction(newer.text, older.text)) {
+          contradictions++;
+          group.conflicts.push({
+            newerId: newer.id,
+            olderId: older.id,
+            newerText: newer.text,
+            olderText: older.text,
+            resolution: 'superseded',
+            reason: '文本矛盾检测：newer-wins',
+          });
+          await store.updateEntrySupersedes(older.id, newer.id);
+          superseded++;
+          break; // older 被它矛盾的最新一条取代即可
+        }
       }
     }
   }

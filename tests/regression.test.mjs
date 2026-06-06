@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryStore } from "../dist/store.js";
 import { KnowledgeGraphManager } from "../dist/knowledge-graph.js";
+import { detectSimpleContradiction } from "../dist/memory-daily-reorg.js";
 
 const DIM = 8;
 const vec = () => new Array(DIM).fill(0.1);
@@ -99,6 +100,12 @@ test("P0: 原子 incrementRecallBatch 计数且不丢行", async () => {
   const got = await store.getByIds([e.id]);
   assert.equal(got.length, 1, "id 唯一");
   assert.equal(got[0].recallCount, 1, "recallCount 应 +1");
+});
+
+test("P2: 中文矛盾能被简易检测到（字符bigram，非空格分词）", () => {
+  // 同主题中文、含否定对，相似度需够高才判矛盾
+  assert.equal(detectSimpleContradiction("计费用 Lago 引擎不要自建", "计费用 Lago 引擎要自建"), true, "中文否定对应检测出矛盾");
+  assert.equal(detectSimpleContradiction("今天天气很好适合出门", "数据库索引需要重建优化"), false, "不相关内容不应误判矛盾");
 });
 
 test("P1: delete 删 0 行返回 false（不假报已删除）", async () => {
