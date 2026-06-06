@@ -312,9 +312,14 @@ export class AutoCaptureEngine {
       const imp = importance || this.config.importance[category as keyof typeof this.config.importance] || 0.5;
       const memoryText = buildCaptureText(normalizedContent, effectiveContext);
       const memoryCategory = normalizeMemoryCategory(category);
-      const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
-      await this.store.store({ text: memoryText.slice(0, 5000), vector, category: memoryCategory, importance: imp, scope, metadata: buildMetadata(category, false, memoryText, memoryCategory) });
-      return { kind: 'stored', type: category, importance: imp, llmUsed: false };
+      try {
+        const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
+        await this.store.store({ text: memoryText.slice(0, 5000), vector, category: memoryCategory, importance: imp, scope, metadata: buildMetadata(category, false, memoryText, memoryCategory) });
+        return { kind: 'stored', type: category, importance: imp, llmUsed: false };
+      } catch (err) {
+        console.error(`[claude-memory-pro] 自动捕获写库失败(${category}): ${err instanceof Error ? err.message : err}`);
+        return null;
+      }
     }
 
     // 路径 2：关键词快速匹配
@@ -324,9 +329,14 @@ export class AutoCaptureEngine {
           const imp = this.config.importance[type as keyof typeof this.config.importance] || 0.5;
           const memoryText = buildCaptureText(normalizedContent, effectiveContext);
           const memoryCategory = normalizeMemoryCategory(type);
-          const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
-          await this.store.store({ text: memoryText.slice(0, 5000), vector, category: memoryCategory, importance: imp, scope, metadata: buildMetadata(type, false, memoryText, memoryCategory) });
-          return { kind: 'stored', type, importance: imp, llmUsed: false };
+          try {
+            const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
+            await this.store.store({ text: memoryText.slice(0, 5000), vector, category: memoryCategory, importance: imp, scope, metadata: buildMetadata(type, false, memoryText, memoryCategory) });
+            return { kind: 'stored', type, importance: imp, llmUsed: false };
+          } catch (err) {
+            console.error(`[claude-memory-pro] 自动捕获写库失败(${type}): ${err instanceof Error ? err.message : err}`);
+            return null;
+          }
         }
       }
     }
@@ -346,14 +356,19 @@ export class AutoCaptureEngine {
         const imp = analysis.importance ?? 0.7;
         const memoryText = analysis.summary.slice(0, 5000);
         const memoryCategory = normalizeMemoryCategory(analysis.type);
-        const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
-        await this.store.store({
-          text: memoryText, vector,
-          category: memoryCategory,
-          importance: imp, scope,
-          metadata: buildMetadata(`llm:${analysis.type}`, true, memoryText, memoryCategory),
-        });
-        return { kind: 'stored', type: analysis.type, importance: imp, llmUsed: true };
+        try {
+          const vector = await this.embedder.embedPassage(memoryText.slice(0, 500));
+          await this.store.store({
+            text: memoryText, vector,
+            category: memoryCategory,
+            importance: imp, scope,
+            metadata: buildMetadata(`llm:${analysis.type}`, true, memoryText, memoryCategory),
+          });
+          return { kind: 'stored', type: analysis.type, importance: imp, llmUsed: true };
+        } catch (err) {
+          console.error(`[claude-memory-pro] 自动捕获写库失败(llm:${analysis.type}): ${err instanceof Error ? err.message : err}`);
+          return null;
+        }
       }
     }
 

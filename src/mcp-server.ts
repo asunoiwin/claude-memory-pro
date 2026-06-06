@@ -32,7 +32,7 @@ import {
   parseMemoryMetadata,
   type MetadataStance,
 } from "./knowledge-graph.js";
-import { promoteMemoriesFromStore, recoverMissedPhases, getDreamStats, readDreamTrail, DEFAULT_CONFIG as DREAM_DEFAULT_CONFIG, type DreamConfig } from "./dream-manager.js";
+import { promoteMemoriesFromStore, recoverMissedPhases, getDreamStats, readDreamTrail, DEFAULT_CONFIG as DREAM_DEFAULT_CONFIG, type DreamConfig, saveLastRunState, loadLastRunState } from "./dream-manager.js";
 import { runDailyReorganization } from "./memory-daily-reorg.js";
 
 // ============================================================================
@@ -1388,6 +1388,10 @@ async function main() {
       if (result.written > 0) {
         console.error(`[claude-memory-pro] Dream auto-promote: ${result.written} written, ${result.skipped} skipped`);
       }
+      // 记 last-run，避免进程跑超 24h 重启后重复跑 light
+      const st = loadLastRunState();
+      st.light = new Date().toISOString();
+      saveLastRunState(st);
     } catch (err) {
       console.error(`[claude-memory-pro] Dream auto-promote failed: ${err}`);
     }
@@ -1413,7 +1417,6 @@ function gracefulShutdown(signal: string) {
     // 同步刷新 habit 产物
     refreshHabitArtifacts();
     // 更新 dream last-run 标记
-    const { saveLastRunState, loadLastRunState } = require('./dream-manager.js');
     const state = loadLastRunState();
     (state as any)._lastSessionEnd = new Date().toISOString();
     saveLastRunState(state);

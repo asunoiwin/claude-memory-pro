@@ -200,7 +200,7 @@ function saveTrailState(state: TrailState): void {
   try {
     mkdirSync(dirname(TRAIL_STATE_FILE), { recursive: true });
     writeFileSync(TRAIL_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
-  } catch {}
+  } catch (err) { console.error(`[claude-memory-pro] dream trail 状态落盘失败: ${err instanceof Error ? err.message : err}`); }
 }
 
 // ============================================================================
@@ -344,7 +344,7 @@ export function saveLastRunState(state: LastRunState): void {
   try {
     mkdirSync(dirname(LAST_RUN_FILE), { recursive: true });
     writeFileSync(LAST_RUN_FILE, JSON.stringify(state, null, 2), 'utf8');
-  } catch {}
+  } catch (err) { console.error(`[claude-memory-pro] dream last-run 落盘失败（可能致重复晋升）: ${err instanceof Error ? err.message : err}`); }
 }
 
 export function needsRecovery(lastRun: string | null, intervalMs: number): boolean {
@@ -457,7 +457,7 @@ type: feedback
       const entry = '\n## Dream Promoted\n- [dream-promoted.md](dream-promoted.md) — Dream 晋升的高频记忆（自动同步）\n';
       writeFileSync(MEMORY_INDEX, indexContent.trimEnd() + '\n' + entry, 'utf8');
     }
-  } catch {}
+  } catch (err) { console.error(`[claude-memory-pro] MEMORY 索引更新失败: ${err instanceof Error ? err.message : err}`); }
 
   return newEntries.length;
 }

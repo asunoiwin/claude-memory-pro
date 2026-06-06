@@ -158,8 +158,12 @@ function saveStats(stats: Map<string, MemoryRecallStats>): void {
     version: '2.0',
     stats: Array.from(stats.values()),
   };
-  writeFileSync(HABIT_FILE, JSON.stringify(data, null, 2), 'utf-8');
-  writeFileSync(HABIT_ROLLUP_FILE, buildRollupMarkdown(stats), 'utf-8');
+  try {
+    writeFileSync(HABIT_FILE, JSON.stringify(data, null, 2), 'utf-8');
+    writeFileSync(HABIT_ROLLUP_FILE, buildRollupMarkdown(stats), 'utf-8');
+  } catch (err) {
+    console.error(`[claude-memory-pro] 习惯统计落盘失败: ${err instanceof Error ? err.message : err}`);
+  }
 }
 
 export function recordRecall(memoryId: string, memoryText: string, category: string, timestamp?: string): void {
