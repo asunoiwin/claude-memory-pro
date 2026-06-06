@@ -101,6 +101,13 @@ test("P0: 原子 incrementRecallBatch 计数且不丢行", async () => {
   assert.equal(got[0].recallCount, 1, "recallCount 应 +1");
 });
 
+test("P1: delete 删 0 行返回 false（不假报已删除）", async () => {
+  assert.equal(await store.delete("non-existent-id-xyz"), false, "删不存在的 id 应返回 false");
+  const e = await store.store({ text: "delete target real", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
+  assert.equal(await store.delete(e.id), true, "删真实存在的应返回 true");
+  assert.equal(await store.delete(e.id), false, "重复删已删除的应返回 false");
+});
+
 test("listAll化: getRecallCandidates 按召回量取 top（不漏老的高频，库已 >500）", async () => {
   const lo = await store.store({ text: "recall cand low", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
   const hi = await store.store({ text: "recall cand high", vector: vec(), category: "fact", scope: "test", importance: 0.5 });

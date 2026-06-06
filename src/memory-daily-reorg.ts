@@ -14,6 +14,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { normalizeFactKey } from './knowledge-graph.js';
 
 // ============================================================================
 // Types
@@ -27,6 +28,7 @@ interface MemoryEntry {
   importance: number;
   timestamp: number;
   metadata?: string;
+  recallCount?: number;
 }
 
 interface EntityGroup {
@@ -66,10 +68,9 @@ const MAX_AGE_DAYS = 30;
 
 function extractEntityKey(entry: MemoryEntry): string | null {
   try {
-    if (entry.metadata) {
-      const meta = JSON.parse(entry.metadata);
-      if (meta.entityKey) return meta.entityKey;
-    }
+    const meta = entry.metadata ? JSON.parse(entry.metadata) : {};
+    // 与 KG 口径对齐：系统实际写的是 factKey（旧 entityKey 作兼容回退）
+    return normalizeFactKey(meta.factKey) || (typeof meta.entityKey === 'string' ? meta.entityKey : null);
   } catch {}
   return null;
 }
@@ -176,7 +177,8 @@ function findExpiredMemories(entries: MemoryEntry[]): string[] {
   const maxAgeMs = MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
   return entries
     .filter(e => {
-      // 有召回记录的不过期
+      // 有召回记录的不过期（热记忆保护）
+      if ((e.recallCount ?? 0) > 0) return false;
       try {
         if (e.metadata) {
           const meta = JSON.parse(e.metadata);

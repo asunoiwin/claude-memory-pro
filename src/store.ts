@@ -249,6 +249,9 @@ export class MemoryStore {
         const scopeConditions = scopeFilter.map(s => `scope = '${escapeSqlLiteral(s)}'`).join(" OR ");
         condition += ` AND (${scopeConditions})`;
       }
+      // 真删到才算成功：删 0 行（id 不存在 / 域不匹配）返回 false，避免假"已删除"确认
+      const matched = await this.table.countRows(condition);
+      if (matched === 0) return false;
       await this.table.delete(condition);
       return true;
     } catch {
