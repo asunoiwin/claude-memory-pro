@@ -11,7 +11,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 
-import { MemoryStore } from "./store.js";
+import { getVectorIssue, MemoryStore, type MemoryEntry, type VectorIssue } from "./store.js";
 import { createEmbedder, getVectorDimensions } from "./embedder.js";
 import { createRetriever, type RetrievalResult } from "./retriever.js";
 import { isNoise } from "./noise-filter.js";
@@ -94,6 +94,11 @@ function clamp01(v: number, fallback = 0.7): number {
   return Math.min(1, Math.max(0, v));
 }
 
+function clampInt(v: number, min: number, max: number): number {
+  if (!Number.isFinite(v)) return min;
+  return Math.min(max, Math.max(min, Math.floor(v)));
+}
+
 function formatResults(results: RetrievalResult[]): string {
   if (results.length === 0) return "未找到相关记忆。";
   return results.map((r, i) => {
@@ -109,6 +114,52 @@ function formatResults(results: RetrievalResult[]): string {
     const metaStr = metaParts.length > 0 ? ` {${metaParts.join(", ")}}` : "";
     return `${i + 1}. [${r.entry.category}:${r.entry.scope}] ${r.entry.text}${metaStr} (${(r.score * 100).toFixed(0)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
   }).join("\n");
+}
+
+type VectorHealth = {
+  total: number;
+  valid: number;
+  zero: number;
+  badDim: number;
+  empty: number;
+  coveragePct: number;
+};
+
+function newVectorHealth(): VectorHealth {
+  return { total: 0, valid: 0, zero: 0, badDim: 0, empty: 0, coveragePct: 100 };
+}
+
+function finalizeVectorHealth(health: VectorHealth): VectorHealth {
+  health.coveragePct = health.total === 0 ? 100 : Number(((health.valid / health.total) * 100).toFixed(2));
+  return health;
+}
+
+function tallyVector(entry: MemoryEntry, health: VectorHealth): VectorIssue | null {
+  const issue = getVectorIssue(entry.vector, vectorDim);
+  health.total += 1;
+  if (!issue) {
+    health.valid += 1;
+    return null;
+  }
+  health[issue] += 1;
+  return issue;
+}
+
+async function scanVectorHealth(scope?: string, pageSize = 500): Promise<VectorHealth> {
+  const scopeFilter = scope ? [scope] : undefined;
+  const totalRows = await store.count(scopeFilter);
+  const safePageSize = clampInt(pageSize, 1, 1000);
+  const health = newVectorHealth();
+
+  for (let offset = 0; offset < totalRows; offset += safePageSize) {
+    const entries = await store.scan(scopeFilter, safePageSize, offset);
+    if (entries.length === 0) break;
+    for (const entry of entries) {
+      tallyVector(entry, health);
+    }
+  }
+
+  return finalizeVectorHealth(health);
 }
 
 // ============================================================================
@@ -331,6 +382,7 @@ server.tool(
   {},
   async () => {
     const stats = await store.stats();
+    const vectorHealth = await scanVectorHealth();
     const config = retriever.getConfig();
     const cacheStats = embedder.cacheStats;
     const habitSummary = getHabitSummary();
@@ -342,7 +394,8 @@ server.tool(
       `• 总记忆数：${stats.totalCount}`,
       `• 检索模式：${config.mode}`,
       `• FTS 支持：${store.hasFtsSupport ? "是" : "否"}`,
-      `• 嵌入缓存：${cacheStats.size} 条，命中率 ${cacheStats.hitRate}`,
+      `• 嵌入缓存（进程内临时缓存，非存量覆盖率）：${cacheStats.size} 条，命中率 ${cacheStats.hitRate}`,
+      `• vectorHealth: { total: ${vectorHealth.total}, valid: ${vectorHealth.valid}, zero: ${vectorHealth.zero}, badDim: ${vectorHealth.badDim}, empty: ${vectorHealth.empty}, coveragePct: ${vectorHealth.coveragePct} }`,
       ``, `按域分布：`,
       ...Object.entries(stats.scopeCounts).map(([s, c]) => `  • ${s}: ${c}`),
       ``, `按分类分布：`,
@@ -352,6 +405,73 @@ server.tool(
       ``, `知识图谱：${atlasStatus ? `已生成（${atlasStatus.totalIndexed || 0}条，${Array.isArray(atlasStatus.clusters) ? atlasStatus.clusters.length : 0}个聚类）` : '未生成'}`,
       ``, `捕获队列：总计${journalStats.total}，待处理${journalStats.pending}`,
     ];
+    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+  }
+);
+
+// -- memory_reindex --
+server.tool(
+  "memory_reindex",
+  "诊断并修复存量记忆的向量健康。dryRun 默认只统计真实 LanceDB 覆盖率，不写入。",
+  {
+    dryRun: z.boolean().default(true).describe("true=只报告不写入；false=对坏向量重新嵌入并回填"),
+    batchSize: z.number().min(1).max(500).default(50).describe("扫描和回填批大小（默认50）"),
+    scope: z.string().optional().describe("限定记忆域（可选）"),
+  },
+  async ({ dryRun, batchSize, scope }) => {
+    const scopeFilter = scope ? [scope] : undefined;
+    const safeBatchSize = clampInt(batchSize, 1, 500);
+    const totalRows = await store.count(scopeFilter);
+    const health = newVectorHealth();
+    const badEntries: Array<{ entry: MemoryEntry; issue: VectorIssue }> = [];
+
+    for (let offset = 0; offset < totalRows; offset += safeBatchSize) {
+      const entries = await store.scan(scopeFilter, safeBatchSize, offset);
+      if (entries.length === 0) break;
+      for (const entry of entries) {
+        const issue = tallyVector(entry, health);
+        if (issue) badEntries.push({ entry, issue });
+      }
+    }
+    finalizeVectorHealth(health);
+
+    let repaired = 0;
+    let failed = 0;
+    const failedIds: string[] = [];
+
+    if (!dryRun) {
+      for (let i = 0; i < badEntries.length; i += safeBatchSize) {
+        const batch = badEntries.slice(i, i + safeBatchSize);
+        for (const { entry } of batch) {
+          try {
+            const vector = await embedder.embedPassage(entry.text.slice(0, 500));
+            const updated = await store.update(entry.id, { vector });
+            if (updated) {
+              repaired += 1;
+            } else {
+              failed += 1;
+              failedIds.push(entry.id);
+            }
+          } catch {
+            failed += 1;
+            failedIds.push(entry.id);
+          }
+        }
+      }
+    }
+
+    const lines = [
+      `memory_reindex ${dryRun ? "dryRun" : "执行"} 完成：`,
+      `• scope：${scope || "全部"}`,
+      `• 总数：${health.total}`,
+      `• 有效：${health.valid}（coveragePct=${health.coveragePct}）`,
+      `• 坏向量：${badEntries.length}（zero=${health.zero}, badDim=${health.badDim}, empty=${health.empty}）`,
+      `• 本次回填数：${repaired}`,
+      `• 失败数：${failed}`,
+    ];
+    if (failedIds.length > 0) {
+      lines.push(`• 失败ID：${failedIds.slice(0, 20).map(id => id.slice(0, 8)).join(", ")}${failedIds.length > 20 ? " ..." : ""}`);
+    }
     return { content: [{ type: "text" as const, text: lines.join("\n") }] };
   }
 );
@@ -645,7 +765,11 @@ server.tool(
 
     if (existing) {
       const meta = { ...JSON.parse(existing.metadata || "{}"), subject, project, status, parentTaskId, description, type: "task", updatedAt: new Date().toISOString() };
-      await store.update(existing.id, { text, metadata: JSON.stringify(meta) });
+      const updates: Record<string, any> = { text, metadata: JSON.stringify(meta) };
+      if (existing.text !== text) {
+        updates.vector = await embedder.embedPassage(text.slice(0, 500));
+      }
+      await store.update(existing.id, updates);
       return { content: [{ type: "text" as const, text: `已更新任务 [${existing.id.slice(0, 8)}]：${subject} → ${status}` }] };
     }
 

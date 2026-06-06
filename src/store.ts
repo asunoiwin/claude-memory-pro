@@ -32,6 +32,8 @@ export interface StoreConfig {
   vectorDim: number;
 }
 
+export type VectorIssue = "empty" | "badDim" | "zero";
+
 // ============================================================================
 // LanceDB Dynamic Import
 // ============================================================================
@@ -56,6 +58,58 @@ function clampInt(value: number, min: number, max: number): number {
 
 function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
+}
+
+const MIN_VECTOR_L2_NORM = 1e-6;
+
+function toVectorArray(vector: unknown): number[] | null {
+  if (!vector) return null;
+  if (Array.isArray(vector)) return vector;
+  if (typeof vector === "object" && Symbol.iterator in vector) {
+    return Array.from(vector as Iterable<number>);
+  }
+  return null;
+}
+
+export function getVectorIssue(
+  vector: unknown,
+  vectorDim: number,
+  minL2Norm = MIN_VECTOR_L2_NORM
+): VectorIssue | null {
+  const values = toVectorArray(vector);
+  if (!values || values.length === 0) return "empty";
+  if (values.length !== vectorDim) return "badDim";
+
+  let normSq = 0;
+  for (const value of values) {
+    if (typeof value !== "number" || !Number.isFinite(value)) return "badDim";
+    normSq += value * value;
+  }
+
+  return Math.sqrt(normSq) > minL2Norm ? null : "zero";
+}
+
+export function validateVector(vector: unknown, vectorDim: number): asserts vector is number[] {
+  const issue = getVectorIssue(vector, vectorDim);
+  if (!issue) return;
+  throw new Error(
+    `Invalid memory vector (${issue}): expected ${vectorDim} dimensions and L2 norm > ${MIN_VECTOR_L2_NORM}`
+  );
+}
+
+function rowToMemoryEntry(row: any): MemoryEntry {
+  return {
+    id: row.id,
+    text: row.text,
+    vector: Array.from(row.vector || []) as number[],
+    category: row.category,
+    scope: row.scope,
+    importance: row.importance,
+    timestamp: row.timestamp,
+    metadata: row.metadata,
+    recallCount: row.recallCount || 0,
+    lastRecallAt: row.lastRecallAt || 0,
+  };
 }
 
 // ============================================================================
@@ -114,6 +168,7 @@ export class MemoryStore {
 
   async store(entry: Omit<MemoryEntry, "id" | "timestamp">): Promise<MemoryEntry> {
     if (!this.table) throw new Error("Store not initialized");
+    validateVector(entry.vector, this.config.vectorDim);
     const full: MemoryEntry = {
       ...entry,
       id: randomUUID(),
@@ -144,18 +199,7 @@ export class MemoryStore {
     const results = await query.toArray();
     return results
       .map((row: any) => ({
-        entry: {
-          id: row.id,
-          text: row.text,
-          vector: Array.from(row.vector || []) as number[],
-          category: row.category,
-          scope: row.scope,
-          importance: row.importance,
-          timestamp: row.timestamp,
-          metadata: row.metadata,
-          recallCount: row.recallCount || 0,
-          lastRecallAt: row.lastRecallAt || 0,
-        },
+        entry: rowToMemoryEntry(row),
         score: Math.max(0, 1 - (row._distance || 0)),
       }))
       .filter((r: MemorySearchResult) => r.score >= minScore);
@@ -179,18 +223,7 @@ export class MemoryStore {
 
       const results = await search.toArray();
       return results.map((row: any) => ({
-        entry: {
-          id: row.id,
-          text: row.text,
-          vector: Array.from(row.vector || []) as number[],
-          category: row.category,
-          scope: row.scope,
-          importance: row.importance,
-          timestamp: row.timestamp,
-          metadata: row.metadata,
-          recallCount: row.recallCount || 0,
-          lastRecallAt: row.lastRecallAt || 0,
-        },
+        entry: rowToMemoryEntry(row),
         score: row._score || 0.5,
       }));
     } catch {
@@ -205,18 +238,7 @@ export class MemoryStore {
       .where(`(${conditions})`)
       .limit(ids.length)
       .toArray();
-    return results.map((row: any) => ({
-      id: row.id,
-      text: row.text,
-      vector: Array.from(row.vector || []) as number[],
-      category: row.category,
-      scope: row.scope,
-      importance: row.importance,
-      timestamp: row.timestamp,
-      metadata: row.metadata,
-      recallCount: row.recallCount || 0,
-      lastRecallAt: row.lastRecallAt || 0,
-    }));
+    return results.map(rowToMemoryEntry);
   }
 
   async delete(id: string, scopeFilter?: string[]): Promise<boolean> {
@@ -240,6 +262,9 @@ export class MemoryStore {
     scopeFilter?: string[]
   ): Promise<MemoryEntry | null> {
     if (!this.table) return null;
+    if ("vector" in updates) {
+      validateVector(updates.vector, this.config.vectorDim);
+    }
     // LanceDB doesn't have native update, so we read-delete-insert
     const existing = await this.getByIds([id]);
     if (existing.length === 0) return null;
@@ -257,6 +282,32 @@ export class MemoryStore {
     await this.table.delete(`id = '${escapeSqlLiteral(id)}'`);
     await this.table.add([updated as any]);
     return updated;
+  }
+
+  async count(scopeFilter?: string[]): Promise<number> {
+    if (!this.table) return 0;
+    if (!scopeFilter || scopeFilter.length === 0) return await this.table.countRows();
+    const scopeConditions = scopeFilter.map(s => `scope = '${escapeSqlLiteral(s)}'`).join(" OR ");
+    return await this.table.countRows(`(${scopeConditions})`);
+  }
+
+  async scan(
+    scopeFilter?: string[],
+    limit = 500,
+    offset = 0
+  ): Promise<MemoryEntry[]> {
+    if (!this.table) return [];
+    const safeLimit = clampInt(limit, 1, 5000);
+    const safeOffset = clampInt(offset, 0, Number.MAX_SAFE_INTEGER);
+
+    let query = this.table.query().limit(safeLimit).offset(safeOffset);
+    if (scopeFilter && scopeFilter.length > 0) {
+      const scopeConditions = scopeFilter.map(s => `scope = '${escapeSqlLiteral(s)}'`).join(" OR ");
+      query = query.where(`(${scopeConditions})`);
+    }
+
+    const results = await query.toArray();
+    return results.map(rowToMemoryEntry);
   }
 
   async incrementRecallBatch(ids: string[]): Promise<void> {
@@ -304,18 +355,7 @@ export class MemoryStore {
     const results = await query.toArray();
     // Sort by timestamp descending (newest first) instead of vector distance
     results.sort((a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0));
-    return results.slice(offset, offset + safeLimit).map((row: any) => ({
-      id: row.id,
-      text: row.text,
-      vector: Array.from(row.vector || []) as number[],
-      category: row.category,
-      scope: row.scope,
-      importance: row.importance,
-      timestamp: row.timestamp,
-      metadata: row.metadata,
-      recallCount: row.recallCount || 0,
-      lastRecallAt: row.lastRecallAt || 0,
-    }));
+    return results.slice(offset, offset + safeLimit).map(rowToMemoryEntry);
   }
 
   async getRecallCandidates(limit = 200): Promise<MemoryEntry[]> {
@@ -350,14 +390,17 @@ export class MemoryStore {
     scopeCounts: Record<string, number>;
     categoryCounts: Record<string, number>;
   }> {
-    // Scan up to 5000 entries for accurate stats
-    const entries = await this.list(scopeFilter, undefined, 5000);
+    // Scan up to 5000 entries for distribution stats.
+    const [totalCount, entries] = await Promise.all([
+      this.count(scopeFilter),
+      this.scan(scopeFilter, 5000),
+    ]);
     const scopeCounts: Record<string, number> = {};
     const categoryCounts: Record<string, number> = {};
     for (const entry of entries) {
       scopeCounts[entry.scope] = (scopeCounts[entry.scope] || 0) + 1;
       categoryCounts[entry.category] = (categoryCounts[entry.category] || 0) + 1;
     }
-    return { totalCount: entries.length, scopeCounts, categoryCounts };
+    return { totalCount, scopeCounts, categoryCounts };
   }
 }
