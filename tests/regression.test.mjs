@@ -126,6 +126,14 @@ test("双审#4: 两个同向否定句不应误判矛盾（不要 vs 不要）", 
   assert.equal(detectSimpleContradiction("这个功能不能开启给用户", "这个功能不能关闭给用户"), false, "都是'不能'同向，不是矛盾");
 });
 
+test("复审#4: 否定窗口模型能识别 不允许/别/勿 类真矛盾（原先漏判）", () => {
+  assert.equal(detectSimpleContradiction("不允许外部访问数据库", "允许外部访问数据库"), true, "不允许 vs 允许");
+  assert.equal(detectSimpleContradiction("别开启调试模式给生产", "开启调试模式给生产"), true, "别开启 vs 开启");
+  assert.equal(detectSimpleContradiction("勿添加管理员权限给访客", "添加管理员权限给访客"), true, "勿添加 vs 添加");
+  // 反义词各自肯定也算矛盾
+  assert.equal(detectSimpleContradiction("开启调试模式给所有人", "关闭调试模式给所有人"), true, "开启 vs 关闭");
+});
+
 test("双审#3: incrementRecallBatch 并发自增不丢计数（DB端原子）", async () => {
   const e = await store.store({ text: "concurrent recall target", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
   await Promise.all(Array.from({ length: 20 }, () => store.incrementRecallBatch([e.id])));
@@ -133,16 +141,24 @@ test("双审#3: incrementRecallBatch 并发自增不丢计数（DB端原子）",
   assert.equal(got[0].recallCount, 20, "20 次并发自增应得 20（非 read-modify-write 丢计数）");
 });
 
-test("双审#2: 召回计数写不触发图谱全量重建（noteRecallCountWrite 吸收）", async () => {
-  const e = await store.store({ text: "note benign write target", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
+test("双审#2: 召回计数不推进结构版本（不触发重建），且绝不掩盖结构写", async () => {
+  const e = await store.store({ text: "structural version target", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
   const kg = new KnowledgeGraphManager(store);
   await kg.build();
-  const bv0 = kg.getBuiltVersion();
-  const vBefore = await store.version();
-  assert.equal(bv0, vBefore, "build 后 builtVersion 应等于当前版本");
-  await store.incrementRecallBatch([e.id]); // 良性写，版本+1
-  await kg.noteRecallCountWrite(vBefore);
-  assert.equal(kg.getBuiltVersion(), await store.version(), "良性写后 builtVersion 应已推进到最新（下次召回不重建）");
+  const sv0 = store.structuralVersion();
+  assert.equal(kg.getBuiltVersion(), sv0, "build 后 builtVersion==结构版本");
+
+  // 召回计数：不推进结构版本 → ensureFresh 不重建
+  await store.incrementRecallBatch([e.id]);
+  assert.equal(store.structuralVersion(), sv0, "召回计数不应推进结构版本");
+  const n0 = kg.getStats().totalNodes;
+  await kg.ensureFresh();
+  assert.equal(kg.getBuiltVersion(), sv0, "召回计数后不应重建");
+
+  // 关键：召回计数写之后再来一条结构写，ensureFresh 必须重建并纳入（不被掩盖）
+  await store.store({ text: "structural after recall zzz", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
+  await kg.ensureFresh();
+  assert.equal(kg.getStats().totalNodes, n0 + 1, "结构写绝不能被召回计数掩盖，必须重建纳入");
 });
 
 test("P1: delete 删 0 行返回 false（不假报已删除）", async () => {
