@@ -5,7 +5,8 @@
  *
  * Design:
  * - KG nodes: memoryId + summary + entityKey + categories (NO full content)
- * - KG edges: causal / temporal / subject / category / contradicts
+ * - KG edges: causal / temporal / subject / contradicts
+ * - Category is retained as a node/index property, but build does not create category edges.
  * - Source of truth: LanceDB (full content)
  * - KG lives in memory; built from LanceDB on server start
  * - Incremental updates on new memory store
@@ -84,14 +85,18 @@ function tokenize(text: string): string[] {
   return [...new Set([...spaceTokens, ...bigrams])];
 }
 
-function textOverlap(a: string, b: string, minJaccard = 0.10): boolean {
+function tokenJaccard(a: string, b: string): number {
   const tokensA = new Set(tokenize(a));
   const tokensB = new Set(tokenize(b));
-  if (tokensA.size === 0 || tokensB.size === 0) return false;
+  if (tokensA.size === 0 || tokensB.size === 0) return 0;
   let intersection = 0;
   for (const t of tokensA) { if (tokensB.has(t)) intersection++; }
   const union = tokensA.size + tokensB.size - intersection;
-  return intersection / union >= minJaccard;
+  return intersection / union;
+}
+
+function textOverlap(a: string, b: string, minJaccard = 0.10): boolean {
+  return tokenJaccard(a, b) >= minJaccard;
 }
 
 function parseMetadata(entry: MemoryEntry): Record<string, any> {
@@ -104,16 +109,71 @@ function normalizeHint(value: unknown): string | null {
   return normalized || null;
 }
 
+const GENERIC_HINT_TOKENS = new Set([
+  'global', 'manual', 'manual_store', 'store', 'memory', 'memories', 'claude',
+  'task', 'lesson', 'other', 'source', 'scope', 'system', 'user', 'entry',
+  'update', 'updated', 'create', 'created', 'note', 'notes', 'info',
+]);
+
+const CAUSAL_TERMS = [
+  'because', 'therefore', 'thus', 'caused', 'causes', 'causing', 'cause',
+  'leads to', 'lead to', 'results in', 'resulted in', 'due to', 'depends on',
+  'blocks', 'blocked by', 'fixes', 'fixed', 'resolves', 'resolved',
+  '因为', '由于', '导致', '所以', '因此', '从而', '使得', '触发', '依赖', '阻塞', '修复', '解决', '影响',
+];
+
+const CAUSAL_EDGE_THRESHOLD = 0.30;
+const MIN_SHARED_CAUSAL_HINTS = 2;
+
+function isDiscriminativeHint(token: string): boolean {
+  if (!token || GENERIC_HINT_TOKENS.has(token)) return false;
+  if (/^\d+$/.test(token)) return false;
+  if (/^[a-z0-9_ -]{1,2}$/.test(token)) return false;
+  return true;
+}
+
+function addHintValue(tokens: Set<string>, value: unknown): void {
+  const normalized = normalizeHint(value);
+  if (!normalized || !isDiscriminativeHint(normalized)) return;
+  tokens.add(normalized);
+  for (const token of tokenize(normalized)) {
+    if (isDiscriminativeHint(token)) tokens.add(token);
+  }
+}
+
+function addHintList(tokens: Set<string>, value: unknown): void {
+  if (!Array.isArray(value)) return;
+  for (const item of value) addHintValue(tokens, item);
+}
+
+function addCausalTerms(tokens: Set<string>, text: string): void {
+  const lower = text.toLowerCase();
+  for (const term of CAUSAL_TERMS) {
+    if (lower.includes(term.toLowerCase())) tokens.add(`causal:${term.toLowerCase()}`);
+  }
+}
+
 function extractHintTokens(entry: MemoryEntry): string[] {
   const meta = parseMetadata(entry);
-  const values = [meta.factKey, meta.taskKey, meta.ruleHint, meta.scope, entry.scope, meta.source];
   const tokens = new Set<string>();
-  for (const value of values) {
-    const normalized = normalizeHint(value);
-    if (!normalized) continue;
-    tokens.add(normalized);
-    for (const token of tokenize(normalized)) tokens.add(token);
-  }
+  const values = [
+    meta.factKey,
+    meta.taskKey,
+    meta.ruleHint,
+    meta.summary,
+    meta.entityKey,
+    meta.topic,
+    meta.component,
+    meta.file,
+    meta.symbol,
+    extractEntityKey(entry),
+  ];
+  for (const value of values) addHintValue(tokens, value);
+  addHintList(tokens, meta.entities);
+  addHintList(tokens, meta.keywords);
+  addHintList(tokens, meta.causalHints);
+  addCausalTerms(tokens, entry.text);
+  if (typeof meta.summary === 'string') addCausalTerms(tokens, meta.summary);
   return Array.from(tokens);
 }
 
@@ -153,13 +213,26 @@ function contradictionStrength(a: MemoryEntry, b: MemoryEntry): number {
   return 0;
 }
 
-function sharedHintStrength(a: MemoryEntry, b: MemoryEntry): number {
+function sharedHintStats(a: MemoryEntry, b: MemoryEntry): { shared: number; jaccard: number; overlapCoefficient: number } {
   const aHints = new Set(extractHintTokens(a));
   const bHints = new Set(extractHintTokens(b));
-  if (aHints.size === 0 || bHints.size === 0) return 0;
-  let overlap = 0;
-  for (const token of aHints) { if (bHints.has(token)) overlap++; }
-  return overlap;
+  if (aHints.size === 0 || bHints.size === 0) return { shared: 0, jaccard: 0, overlapCoefficient: 0 };
+  let shared = 0;
+  for (const token of aHints) { if (bHints.has(token)) shared++; }
+  const union = aHints.size + bHints.size - shared;
+  return {
+    shared,
+    jaccard: union > 0 ? shared / union : 0,
+    overlapCoefficient: shared / Math.min(aHints.size, bHints.size),
+  };
+}
+
+function causalEdgeWeight(a: MemoryEntry, b: MemoryEntry, summaryA: string, summaryB: string): number {
+  const hintStats = sharedHintStats(a, b);
+  if (hintStats.shared < MIN_SHARED_CAUSAL_HINTS) return 0;
+  const summarySimilarity = tokenJaccard(summaryA, summaryB);
+  const weight = (hintStats.jaccard * 0.65) + (hintStats.overlapCoefficient * 0.25) + (summarySimilarity * 0.10);
+  return weight >= CAUSAL_EDGE_THRESHOLD ? Number(Math.min(weight, 0.85).toFixed(3)) : 0;
 }
 
 function extractEntityKey(entry: MemoryEntry): string | null {
@@ -253,39 +326,22 @@ export class KnowledgeGraphManager {
         const entryA = entriesById.get(a.id), entryB = entriesById.get(b.id);
         if (!entryA || !entryB) continue;
         const metaA = parseMetadata(entryA), metaB = parseMetadata(entryB);
-        const hintStrength = sharedHintStrength(entryA, entryB);
 
         // Subject / entity match
         if (a.entityKey && a.entityKey === b.entityKey) {
           this.kg.edges.push({ source: a.id, target: b.id, relation: 'subject', weight: 0.9 });
-          if (a.createdAt < b.createdAt) {
-            this.kg.edges.push({ source: a.id, target: b.id, relation: 'temporal', weight: 0.5 });
-          }
         }
 
         const sameFactKey = normalizeHint(metaA.factKey) && normalizeHint(metaA.factKey) === normalizeHint(metaB.factKey);
         const sameTaskKey = normalizeHint(metaA.taskKey) && normalizeHint(metaA.taskKey) === normalizeHint(metaB.taskKey);
         if (sameFactKey || sameTaskKey) {
           this.kg.edges.push({ source: a.id, target: b.id, relation: 'subject', weight: 0.85 });
-          if (a.createdAt < b.createdAt) {
-            this.kg.edges.push({ source: a.id, target: b.id, relation: 'temporal', weight: 0.65 });
-          } else if (b.createdAt < a.createdAt) {
-            this.kg.edges.push({ source: b.id, target: a.id, relation: 'temporal', weight: 0.65 });
-          }
         }
 
-        // Category match
-        if (b.categories.some(c => a.categories.includes(c))) {
-          this.kg.edges.push({ source: a.id, target: b.id, relation: 'category', weight: 0.3 });
-        }
-
-        // Causal: text overlap
-        if (textOverlap(a.summary, b.summary, 0.2)) {
-          this.kg.edges.push({ source: a.id, target: b.id, relation: 'causal', weight: 0.4 });
-        }
-
-        if (hintStrength >= 2) {
-          this.kg.edges.push({ source: a.id, target: b.id, relation: 'causal', weight: 0.55 });
+        // Causal: discriminative hints only; no scope/source/category fan-out.
+        const causalWeight = causalEdgeWeight(entryA, entryB, a.summary, b.summary);
+        if (causalWeight > 0) {
+          this.kg.edges.push({ source: a.id, target: b.id, relation: 'causal', weight: causalWeight });
         }
 
         // Contradiction detection
@@ -293,6 +349,22 @@ export class KnowledgeGraphManager {
         if (contradictionWeight > 0) {
           this.kg.edges.push({ source: a.id, target: b.id, relation: 'contradicts', weight: contradictionWeight });
         }
+      }
+    }
+
+    // Temporal edges: only adjacent memories inside the same entity/fact group.
+    for (const ids of this.kg.byEntityKey.values()) {
+      if (ids.length < 2) continue;
+      const sorted = [...ids].sort((idA, idB) => {
+        const nodeA = this.kg.nodes.get(idA);
+        const nodeB = this.kg.nodes.get(idB);
+        if (!nodeA || !nodeB) return 0;
+        return nodeA.createdAt !== nodeB.createdAt
+          ? nodeA.createdAt - nodeB.createdAt
+          : nodeA.id.localeCompare(nodeB.id);
+      });
+      for (let i = 1; i < sorted.length; i++) {
+        this.kg.edges.push({ source: sorted[i - 1], target: sorted[i], relation: 'temporal', weight: 0.65 });
       }
     }
 
