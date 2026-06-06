@@ -10,6 +10,7 @@ import { KnowledgeGraphManager } from "../dist/knowledge-graph.js";
 
 const DIM = 8;
 const vec = () => new Array(DIM).fill(0.1);
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 let dbPath, store;
 
 before(async () => {
@@ -62,4 +63,40 @@ test("Bug A: KG 认 metadata.supersededBy，召回过滤被取代记忆", async 
   const noSup = kg.query("zebraunique legacy", { includeSuperseded: false }).some(r => r.id === older.id);
   assert.ok(withSup, "includeSuperseded=true 仍应能召回（证明它在图谱、可路由）");
   assert.ok(!noSup, "includeSuperseded=false 必须过滤掉被取代的旧记忆");
+});
+
+test("P0: KG entityKey 取代方向正确（留最新，废较旧）", async () => {
+  const fk = JSON.stringify({ factKey: "shared_arch_topic_xyz" });
+  const old1 = await store.store({ text: "arch topic xyz old version", vector: vec(), category: "fact", scope: "test", importance: 0.6, metadata: fk });
+  await sleep(8);
+  const new1 = await store.store({ text: "arch topic xyz new version", vector: vec(), category: "fact", scope: "test", importance: 0.6, metadata: fk });
+
+  const kg = new KnowledgeGraphManager(store);
+  await kg.build();
+  const res = kg.query("arch topic xyz", { includeSuperseded: false });
+  const ids = new Set(res.map(r => r.id));
+  assert.ok(ids.has(new1.id), "应保留最新一条");
+  assert.ok(!ids.has(old1.id), "应过滤掉较旧一条（方向不能反）");
+});
+
+test("P0: 原子 update 不丢行不产生重复", async () => {
+  const before = await store.count();
+  const e = await store.store({ text: "atomic update target original", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
+  assert.equal(await store.count(), before + 1);
+  const upd = await store.update(e.id, { text: "atomic update target CHANGED" });
+  assert.equal(upd.text, "atomic update target CHANGED");
+  assert.equal(await store.count(), before + 1, "update 后总行数不变（无孤儿/无重复）");
+  const got = await store.getByIds([e.id]);
+  assert.equal(got.length, 1, "id 唯一");
+  assert.equal(got[0].text, "atomic update target CHANGED", "更新已持久化");
+});
+
+test("P0: 原子 incrementRecallBatch 计数且不丢行", async () => {
+  const before = await store.count();
+  const e = await store.store({ text: "recall count target", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
+  await store.incrementRecallBatch([e.id]);
+  assert.equal(await store.count(), before + 1, "计数后总行数不变");
+  const got = await store.getByIds([e.id]);
+  assert.equal(got.length, 1, "id 唯一");
+  assert.equal(got[0].recallCount, 1, "recallCount 应 +1");
 });

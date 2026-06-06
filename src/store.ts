@@ -279,8 +279,8 @@ export class MemoryStore {
       timestamp: entry.timestamp,
     };
 
-    await this.table.delete(`id = '${escapeSqlLiteral(id)}'`);
-    await this.table.add([updated as any]);
+    // 原子 upsert（按 id 合并）：避免"先删后加"中途失败丢记忆 / 并发回滚
+    await this.table.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute([updated as any]);
     return updated;
   }
 
@@ -313,19 +313,14 @@ export class MemoryStore {
   async incrementRecallBatch(ids: string[]): Promise<void> {
     if (!this.table || ids.length === 0) return;
     const now = Date.now();
-    for (const id of ids) {
-      try {
-        const entries = await this.getByIds([id]);
-        if (entries.length > 0) {
-          const entry = entries[0];
-          await this.table.delete(`id = '${escapeSqlLiteral(id)}'`);
-          await this.table.add([{
-            ...entry,
-            recallCount: (entry.recallCount || 0) + 1,
-            lastRecallAt: now,
-          } as any]);
-        }
-      } catch { /* ignore individual failures */ }
+    const entries = await this.getByIds(ids);
+    if (entries.length === 0) return;
+    const updated = entries.map(e => ({ ...e, recallCount: (e.recallCount || 0) + 1, lastRecallAt: now }));
+    try {
+      // 原子 upsert，避免"先删后加"在并发/崩溃时丢记忆
+      await this.table.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(updated as any);
+    } catch (err) {
+      console.error(`[claude-memory-pro] incrementRecallBatch 失败: ${err instanceof Error ? err.message : err}`);
     }
   }
 

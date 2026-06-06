@@ -415,9 +415,10 @@ export class KnowledgeGraphManager {
       if (!entityKeyChain.has(ek)) entityKeyChain.set(ek, []);
       entityKeyChain.get(ek)!.push(entry.id);
     }
+    // entries 按时间降序（最新在前），故 ids[0] 为最新：留最新、其余标为被它取代（与 addNode 方向一致）
     for (const [, ids] of entityKeyChain) {
-      for (let i = 0; i < ids.length - 1; i++) {
-        this.supersededCache.set(ids[i], ids[ids.length - 1]);
+      for (let i = 1; i < ids.length; i++) {
+        this.supersededCache.set(ids[i], ids[0]);
       }
     }
     // 显式 supersededBy（跨 entityKey 标废，如矛盾检测裁定）。entityKey 分组之外的补充。
