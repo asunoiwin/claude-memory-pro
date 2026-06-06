@@ -400,6 +400,8 @@ export class KnowledgeGraphManager {
     this.supersededCache = new Map();
   }
 
+  getBuiltVersion(): number { return this.builtVersion; }
+
   /** 召回前调用：store 版本变了（含其它进程的写）就重建，避免拿陈旧/缺新的图谱 */
   async ensureFresh(): Promise<void> {
     const v = await this.store.version();
@@ -407,6 +409,8 @@ export class KnowledgeGraphManager {
   }
 
   async build(): Promise<void> {
+    // 先读版本再取快照：若 build 期间有写入，version 会超过此值，下次 ensureFresh 必重建（不漏写）
+    const snapshotVersion = await this.store.version();
     // listAll 分页捞全量（list 单页上限 500，记忆 >500 时最老的会被静默漏出图谱）
     const allEntries = await this.store.listAll();
     // 方案 C：task 不入图（临时工作流，不属于语义网络）；lesson 通过
@@ -512,7 +516,18 @@ export class KnowledgeGraphManager {
       if (node) node.superseded = true;
     }
 
-    this.builtVersion = await this.store.version();
+    this.builtVersion = snapshotVersion;
+  }
+
+  /**
+   * 召回计数（recallCount+1）只改统计、不改图谱结构，不该触发全量重建。
+   * 若写前图谱仍是最新（builtVersion===写前版本），把 builtVersion 推进到写后版本跳过它；
+   * 若期间有其它（结构性）写入，则不推进，留给 ensureFresh 正常重建。
+   */
+  async noteRecallCountWrite(versionBeforeWrite: number): Promise<void> {
+    if (this.builtVersion === versionBeforeWrite) {
+      this.builtVersion = await this.store.version();
+    }
   }
 
   async addNode(entry: MemoryEntry): Promise<void> {

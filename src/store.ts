@@ -322,12 +322,13 @@ export class MemoryStore {
   async incrementRecallBatch(ids: string[]): Promise<void> {
     if (!this.table || ids.length === 0) return;
     const now = Date.now();
-    const entries = await this.getByIds(ids);
-    if (entries.length === 0) return;
-    const updated = entries.map(e => ({ ...e, recallCount: (e.recallCount || 0) + 1, lastRecallAt: now }));
+    const inList = ids.map(id => `'${escapeSqlLiteral(id)}'`).join(", ");
     try {
-      // 原子 upsert，避免"先删后加"在并发/崩溃时丢记忆
-      await this.table.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(updated as any);
+      // DB 端原子自增（valuesSql 在引擎内对每行算 recallCount+1），避免 read-modify-write 并发丢计数
+      await this.table.update({
+        where: `id IN (${inList})`,
+        valuesSql: { recallCount: "recallCount + 1", lastRecallAt: String(now) },
+      });
     } catch (err) {
       console.error(`[claude-memory-pro] incrementRecallBatch 失败: ${err instanceof Error ? err.message : err}`);
     }
@@ -355,13 +356,21 @@ export class MemoryStore {
   /** 分页捞全量（绕过 list 单页 500 上限），用于 KG/atlas/cleaner 等需完整视图的场景。按时间倒序。 */
   async listAll(scopeFilter?: string[], category?: string): Promise<MemoryEntry[]> {
     const total = await this.count(scopeFilter);
-    const out: MemoryEntry[] = [];
-    for (let offset = 0; offset < total; offset += 1000) {
-      const batch = await this.scan(scopeFilter, 1000, offset);
-      if (batch.length === 0) break;
-      out.push(...batch);
+    // scan 无保证顺序，offset 分页在多页时可能重叠/遗漏：能一次取全就一次取全；
+    // 超过单次上限才分页，并按 id 去重兜底防重叠。
+    let rows: MemoryEntry[];
+    if (total <= 5000) {
+      rows = await this.scan(scopeFilter, Math.max(total, 1), 0);
+    } else {
+      const byId = new Map<string, MemoryEntry>();
+      for (let offset = 0; offset < total * 2 && byId.size < total; offset += 5000) {
+        const batch = await this.scan(scopeFilter, 5000, offset);
+        if (batch.length === 0) break;
+        for (const e of batch) byId.set(e.id, e);
+      }
+      rows = [...byId.values()];
     }
-    const filtered = category ? out.filter(e => e.category === category) : out;
+    const filtered = category ? rows.filter(e => e.category === category) : rows;
     filtered.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
     return filtered;
   }

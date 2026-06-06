@@ -121,6 +121,30 @@ test("P2: 中文矛盾能被简易检测到（字符bigram，非空格分词）"
   assert.equal(detectSimpleContradiction("今天天气很好适合出门", "数据库索引需要重建优化"), false, "不相关内容不应误判矛盾");
 });
 
+test("双审#4: 两个同向否定句不应误判矛盾（不要 vs 不要）", () => {
+  assert.equal(detectSimpleContradiction("计费用 Lago 引擎不要自建", "计费用 Lago 引擎不要自研"), false, "都是'不要'同向，不是矛盾");
+  assert.equal(detectSimpleContradiction("这个功能不能开启给用户", "这个功能不能关闭给用户"), false, "都是'不能'同向，不是矛盾");
+});
+
+test("双审#3: incrementRecallBatch 并发自增不丢计数（DB端原子）", async () => {
+  const e = await store.store({ text: "concurrent recall target", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
+  await Promise.all(Array.from({ length: 20 }, () => store.incrementRecallBatch([e.id])));
+  const got = await store.getByIds([e.id]);
+  assert.equal(got[0].recallCount, 20, "20 次并发自增应得 20（非 read-modify-write 丢计数）");
+});
+
+test("双审#2: 召回计数写不触发图谱全量重建（noteRecallCountWrite 吸收）", async () => {
+  const e = await store.store({ text: "note benign write target", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
+  const kg = new KnowledgeGraphManager(store);
+  await kg.build();
+  const bv0 = kg.getBuiltVersion();
+  const vBefore = await store.version();
+  assert.equal(bv0, vBefore, "build 后 builtVersion 应等于当前版本");
+  await store.incrementRecallBatch([e.id]); // 良性写，版本+1
+  await kg.noteRecallCountWrite(vBefore);
+  assert.equal(kg.getBuiltVersion(), await store.version(), "良性写后 builtVersion 应已推进到最新（下次召回不重建）");
+});
+
 test("P1: delete 删 0 行返回 false（不假报已删除）", async () => {
   assert.equal(await store.delete("non-existent-id-xyz"), false, "删不存在的 id 应返回 false");
   const e = await store.store({ text: "delete target real", vector: vec(), category: "fact", scope: "test", importance: 0.5 });

@@ -388,7 +388,11 @@ server.tool(
     // === 副作用：记录召回频率（暂存层，不影响排序） ===
     if (results.length > 0) {
       recordRecallBatch(results.map(r => ({ id: r.entry.id, text: r.entry.text, category: r.entry.category })));
-      store.incrementRecallBatch(results.map(r => r.entry.id)).catch(() => {});
+      // 召回计数是良性写（不改图谱结构）：写前记版本，写后让 KG 跳过它，避免每次召回都全量重建
+      const vBefore = await store.version();
+      store.incrementRecallBatch(results.map(r => r.entry.id))
+        .then(() => kg?.noteRecallCountWrite(vBefore))
+        .catch(() => {});
     }
 
     if (results.length === 0) {

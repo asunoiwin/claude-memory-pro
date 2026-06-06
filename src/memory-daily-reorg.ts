@@ -123,20 +123,25 @@ function jaccard(a: string, b: string): number {
 }
 
 export function detectSimpleContradiction(newer: string, older: string): boolean {
-  const negationPairs = [
-    [/不[要用能]/, /[要用能]/],
-    [/禁止/, /允许/],
-    [/关闭/, /开启/],
-    [/移除/, /添加/],
-    [/false/i, /true/i],
-  ];
-
   const similarity = jaccard(newer, older);
   if (similarity < 0.3) return false;
 
-  for (const [negA, negB] of negationPairs) {
-    if ((negA.test(newer) && negB.test(older)) || (negB.test(newer) && negA.test(older))) {
-      return true;
+  // ① 显式否定 XOR：一句"不X"、另一句"X"（X∈要/用/能）。正向侧用否定后顾排除"不要"内部的"要"。
+  const neg = /不[要用能]/, pos = /(?<!不)[要用能]/;
+  if ((neg.test(newer) && !neg.test(older) && pos.test(older)) ||
+      (neg.test(older) && !neg.test(newer) && pos.test(newer))) {
+    return true;
+  }
+
+  // ② 反义词对：仅当两句都不含否定词时才比——否则"不能开启"vs"不能关闭"（都被否定）会误判。
+  //    误判会错误隐藏记忆，故从严；细微矛盾交给 GLM 扫描器。
+  const hasNeg = (s: string) => /[不未别勿无]/.test(s);
+  if (!hasNeg(newer) && !hasNeg(older)) {
+    const antonyms: Array<[RegExp, RegExp]> = [
+      [/禁止/, /允许/], [/关闭/, /开启/], [/移除/, /添加/], [/\bfalse\b/i, /\btrue\b/i],
+    ];
+    for (const [a, b] of antonyms) {
+      if ((a.test(newer) && b.test(older)) || (b.test(newer) && a.test(older))) return true;
     }
   }
   return false;
