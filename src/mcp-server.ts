@@ -798,8 +798,9 @@ server.tool(
     maxPairs: z.number().min(1).max(2000).default(200).describe("非 dryRun 时最多判定多少对，控制 LLM 成本（默认200）"),
     judgeModel: z.string().optional().describe("矛盾判定用的 LLM（默认 CAPTURE_MODEL=GLM-4.5-Flash；7B 级漏判率高，建议用 GLM-4.5-Flash 或更强）"),
     scope: z.string().optional().describe("限定记忆域（可选）"),
+    persist: z.boolean().default(false).describe("true 且非 dryRun 时，把每对里较旧的一条标为被较新一条取代（写 supersededBy）；重建 KG 后召回即过滤"),
   },
-  async ({ dryRun, topK, minScore, minConfidence, crossScope, maxPairs, judgeModel, scope }) => {
+  async ({ dryRun, topK, minScore, minConfidence, crossScope, maxPairs, judgeModel, scope, persist }) => {
     const entries = await scanFactEntries(scope, 500);
     const byId = new Map(entries.map(e => [e.id, e]));
 
@@ -864,10 +865,23 @@ server.tool(
       }
     }
 
+    let superseded = 0;
+    if (persist) {
+      for (const c of contradictions) {
+        const [older, newer] = c.a.timestamp <= c.b.timestamp ? [c.a, c.b] : [c.b, c.a];
+        await store.updateEntrySupersedes(older.id, newer.id);
+        superseded += 1;
+      }
+      const kg = getKG();
+      if (kg) await kg.build();
+    }
+
     lines.push(
       `• 实际 LLM 判定：${judged}（失败 ${failed}）`,
       `• 确认矛盾对（sameFact 且 contradicts 且置信≥${minConfidence}）：${contradictions.length}`,
-      "（本工具仅验证收益，不写库）",
+      persist
+        ? `• 已标废较旧记忆：${superseded} 条（newer-wins，已重建 KG，召回即过滤）`
+        : "（本工具仅验证收益，不写库；加 persist=true 可标废较旧的一条）",
     );
     if (contradictions.length > 0) {
       const detail = contradictions.slice(0, 20).map((c, i) =>

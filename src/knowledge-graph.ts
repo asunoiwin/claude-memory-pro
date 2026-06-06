@@ -400,7 +400,13 @@ export class KnowledgeGraphManager {
   }
 
   async build(): Promise<void> {
-    const allEntries = await this.store.list(undefined, undefined, 10000, 0);
+    // store.list 单页上限 500，分页捞全量（否则记忆数 >500 时最老的被静默漏出图谱）
+    const allEntries: MemoryEntry[] = [];
+    for (let offset = 0; ; offset += 500) {
+      const page = await this.store.list(undefined, undefined, 500, offset);
+      allEntries.push(...page);
+      if (page.length < 500) break;
+    }
     // 方案 C：task 不入图（临时工作流，不属于语义网络）；lesson 通过
     const entries = allEntries.filter(e => e.category !== 'task');
     this.kg = { nodes: new Map(), byEntityKey: new Map(), byCategory: new Map(), edges: [], builtAt: new Date().toISOString() };
@@ -417,6 +423,14 @@ export class KnowledgeGraphManager {
     for (const [, ids] of entityKeyChain) {
       for (let i = 0; i < ids.length - 1; i++) {
         this.supersededCache.set(ids[i], ids[ids.length - 1]);
+      }
+    }
+    // 显式 supersededBy（跨 entityKey 标废，如矛盾检测裁定）。entityKey 分组之外的补充。
+    const entryIds = new Set(entries.map(e => e.id));
+    for (const entry of entries) {
+      const supBy = parseMemoryMetadata(entry).supersededBy;
+      if (typeof supBy === 'string' && supBy !== entry.id && entryIds.has(supBy)) {
+        this.supersededCache.set(entry.id, supBy);
       }
     }
 
