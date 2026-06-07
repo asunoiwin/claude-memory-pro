@@ -561,6 +561,9 @@ server.tool(
     const atlasStatus = getMemoryAtlasStatus();
     const journalStats = captureJournal.stats();
 
+    await knowledgeGraph.ensureFresh().catch(() => {});
+    const kgStats = knowledgeGraph.getStats();
+
     const lines = [
       `记忆统计：`,
       `• 总记忆数：${stats.totalCount}`,
@@ -574,7 +577,8 @@ server.tool(
       ...Object.entries(stats.categoryCounts).map(([c, n]) => `  • ${c}: ${n}`),
       ``, `习惯追踪：`,
       `  • 总追踪：${habitSummary.total}，promote: ${habitSummary.promote}，reinforce: ${habitSummary.reinforce}，retain: ${habitSummary.retain}`,
-      ``, `知识图谱：${atlasStatus ? `已生成（${atlasStatus.totalIndexed || 0}条，${Array.isArray(atlasStatus.clusters) ? atlasStatus.clusters.length : 0}个聚类）` : '未生成'}`,
+      ``, `知识图谱（KG）：${kgStats.builtAt ? `${kgStats.totalNodes} 节点（${kgStats.supersededNodes} 被取代）/ ${kgStats.totalEdges} 边 — subject=${kgStats.edgesByRelation.subject}, temporal=${kgStats.edgesByRelation.temporal}, causal=${kgStats.edgesByRelation.causal}, category=${kgStats.edgesByRelation.category}, contradicts=${kgStats.edgesByRelation.contradicts}` : '未构建'}`,
+      `记忆聚类（atlas）：${atlasStatus ? `已生成（${atlasStatus.totalIndexed || 0}条，${Array.isArray(atlasStatus.clusters) ? atlasStatus.clusters.length : 0}个聚类）` : '未生成'}`,
       ``, `捕获队列：总计${journalStats.total}，待处理${journalStats.pending}`,
     ];
     return { content: [{ type: "text" as const, text: lines.join("\n") }] };
@@ -1072,6 +1076,7 @@ server.tool(
     }
 
     // stats
+    await kg.ensureFresh().catch(() => {});
     const s = kg.getStats();
     return { content: [{ type: "text" as const, text: `KG 状态：\n• 节点：${s.totalNodes}（${s.supersededNodes} 被取代）\n• 边：${s.totalEdges}\n• 实体：${s.entityKeys}\n• 分类：${s.categories}\n• 构建时间：${s.builtAt || '未构建'}\n• 边分布：subject=${s.edgesByRelation.subject}, temporal=${s.edgesByRelation.temporal}, causal=${s.edgesByRelation.causal}, category=${s.edgesByRelation.category}, contradicts=${s.edgesByRelation.contradicts}` }] };
   }
