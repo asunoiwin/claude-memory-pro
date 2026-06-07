@@ -400,20 +400,18 @@ export class KnowledgeGraphManager {
     this.supersededCache = new Map();
   }
 
-  getBuiltVersion(): number { return this.builtVersion; }
-
   /**
-   * 召回前调用：结构版本变了（含其它进程的 store/update/delete）就重建。
-   * 用"结构版本"而非全局表版本——召回计数不推进结构版本，故不会触发重建，也不会掩盖结构写。
+   * 召回前调用：表版本变了（含其它进程的写）就重建。表版本原子单调，绝不回退/掩盖结构写。
+   * 召回计数也会变更版本→召回后会重建一次（已接受的性能取舍，换取正确性与零竞态）。
    */
   async ensureFresh(): Promise<void> {
-    const v = this.store.structuralVersion();
+    const v = await this.store.version();
     if (v !== this.builtVersion) await this.build();
   }
 
   async build(): Promise<void> {
-    // 先读结构版本再取快照：若 build 期间有结构写，版本会超过此值，下次 ensureFresh 必重建（不漏写）
-    const snapshotVersion = this.store.structuralVersion();
+    // 先读版本再取快照：若 build 期间有写入，表版本会超过此值，下次 ensureFresh 必重建（不漏写）
+    const snapshotVersion = await this.store.version();
     // listAll 分页捞全量（list 单页上限 500，记忆 >500 时最老的会被静默漏出图谱）
     const allEntries = await this.store.listAll();
     // 方案 C：task 不入图（临时工作流，不属于语义网络）；lesson 通过

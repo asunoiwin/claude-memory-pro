@@ -388,7 +388,7 @@ server.tool(
     // === 副作用：记录召回频率（暂存层，不影响排序） ===
     if (results.length > 0) {
       recordRecallBatch(results.map(r => ({ id: r.entry.id, text: r.entry.text, category: r.entry.category })));
-      // 召回计数不推进"结构版本"，故不会触发 KG 重建，也不会掩盖结构写（见 store.structuralVersion）
+      // 召回计数会变更表版本→下次召回 ensureFresh 会重建图谱（已接受的性能取舍，换取零竞态/不掩盖）
       store.incrementRecallBatch(results.map(r => r.entry.id)).catch(() => {});
     }
 

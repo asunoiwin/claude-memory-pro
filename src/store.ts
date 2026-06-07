@@ -4,8 +4,6 @@
 
 import type * as LanceDB from "@lancedb/lancedb";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
-import { join, dirname } from "node:path";
 
 // ============================================================================
 // Types
@@ -179,7 +177,6 @@ export class MemoryStore {
       lastRecallAt: 0,
     };
     await this.table.add([full as any]);
-    this.bumpStructuralVersion();
     return full;
   }
 
@@ -256,7 +253,6 @@ export class MemoryStore {
       const matched = await this.table.countRows(condition);
       if (matched === 0) return false;
       await this.table.delete(condition);
-      this.bumpStructuralVersion();
       return true;
     } catch {
       return false;
@@ -288,30 +284,17 @@ export class MemoryStore {
 
     // 原子 upsert（按 id 合并）：避免"先删后加"中途失败丢记忆 / 并发回滚
     await this.table.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute([updated as any]);
-    this.bumpStructuralVersion();
     return updated;
   }
 
-  private structuralVersionFile(): string {
-    return join(dirname(this.config.dbPath), "structural-version");
-  }
-
   /**
-   * "结构版本"：只在结构性写（store/update/delete）时推进，召回计数(incrementRecallBatch)不推进。
-   * 与全局表版本解耦，避免"召回计数把版本推高→图谱误重建/或掩盖结构写"。跨进程经此 sidecar 文件共享。
+   * LanceDB 表版本号：每次写(add/update/delete，含召回计数)都由引擎原子单调自增，跨进程可靠。
+   * 用作图谱新鲜度信号——单调原子、绝不回退/掩盖。代价：召回计数也会变更版本→召回后下次
+   * ensureFresh 会重建图谱(已接受的性能取舍，非正确性问题；彻底消除自管计数器的竞态/掩盖)。
    */
-  structuralVersion(): number {
-    try { return parseInt(readFileSync(this.structuralVersionFile(), "utf8"), 10) || 0; }
-    catch { return 0; }
-  }
-
-  private bumpStructuralVersion(): void {
-    // 用自增计数器而非时间戳：并发写至多"少加"(折叠)，绝不会与 build 读到的旧值相等，故永不掩盖结构写。
-    // bump 在数据写之后调用：若 build 的 listAll 看到了新数据但还没读到 bump，下次 ensureFresh 也会因值变化而重建。
-    try {
-      const next = this.structuralVersion() + 1;
-      writeFileSync(this.structuralVersionFile(), String(next));
-    } catch { /* 标记写失败不阻断主写 */ }
+  async version(): Promise<number> {
+    if (!this.table) return 0;
+    try { return await this.table.version(); } catch { return 0; }
   }
 
   async count(scopeFilter?: string[]): Promise<number> {

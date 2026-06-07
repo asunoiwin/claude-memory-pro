@@ -115,23 +115,23 @@ test("P2: ensureFresh 在 store 变更后自动重建（修跨进程/写后陈�
   assert.equal(kg.getStats().totalNodes, n0 + 1, "版本未变不应再增");
 });
 
-test("P2: 中文矛盾能被简易检测到（字符bigram，非空格分词）", () => {
-  // 同主题中文、含否定对，相似度需够高才判矛盾
-  assert.equal(detectSimpleContradiction("计费用 Lago 引擎不要自建", "计费用 Lago 引擎要自建"), true, "中文否定对应检测出矛盾");
-  assert.equal(detectSimpleContradiction("今天天气很好适合出门", "数据库索引需要重建优化"), false, "不相关内容不应误判矛盾");
-});
-
-test("双审#4: 两个同向否定句不应误判矛盾（不要 vs 不要）", () => {
-  assert.equal(detectSimpleContradiction("计费用 Lago 引擎不要自建", "计费用 Lago 引擎不要自研"), false, "都是'不要'同向，不是矛盾");
-  assert.equal(detectSimpleContradiction("这个功能不能开启给用户", "这个功能不能关闭给用户"), false, "都是'不能'同向，不是矛盾");
-});
-
-test("复审#4: 否定窗口模型能识别 不允许/别/勿 类真矛盾（原先漏判）", () => {
+test("中文矛盾: 干净的否定矛盾(X vs 不X)应判矛盾", () => {
+  assert.equal(detectSimpleContradiction("计费用 Lago 引擎不要自建", "计费用 Lago 引擎要自建"), true, "不要X vs 要X");
   assert.equal(detectSimpleContradiction("不允许外部访问数据库", "允许外部访问数据库"), true, "不允许 vs 允许");
   assert.equal(detectSimpleContradiction("别开启调试模式给生产", "开启调试模式给生产"), true, "别开启 vs 开启");
   assert.equal(detectSimpleContradiction("勿添加管理员权限给访客", "添加管理员权限给访客"), true, "勿添加 vs 添加");
-  // 反义词各自肯定也算矛盾
-  assert.equal(detectSimpleContradiction("开启调试模式给所有人", "关闭调试模式给所有人"), true, "开启 vs 关闭");
+});
+
+test("中文矛盾: 三轮审计的各类反例都不误判(从严)", () => {
+  // 同向否定 / 双重否定
+  assert.equal(detectSimpleContradiction("计费用 Lago 引擎不要自建", "计费用 Lago 引擎不要自研"), false, "都'不要'但内容不同");
+  assert.equal(detectSimpleContradiction("这个功能不能开启给用户", "这个功能不能关闭给用户"), false, "都'不能'");
+  assert.equal(detectSimpleContradiction("生产不能不开启审计", "生产开启审计"), false, "双重否定=肯定，不算矛盾");
+  // 单字嵌入常见词 / 子串误命中
+  assert.equal(detectSimpleContradiction("计费用 Lago 引擎自建", "计不用 Lago 引擎自建"), false, "费用≠用，去否定后不等");
+  assert.equal(detectSimpleContradiction("flag falsey value is allowed", "flag true value is allowed"), false, "falsey≠true");
+  // 不相关
+  assert.equal(detectSimpleContradiction("今天天气很好适合出门", "数据库索引需要重建优化"), false, "不相关");
 });
 
 test("双审#3: incrementRecallBatch 并发自增不丢计数（DB端原子）", async () => {
@@ -141,24 +141,22 @@ test("双审#3: incrementRecallBatch 并发自增不丢计数（DB端原子）",
   assert.equal(got[0].recallCount, 20, "20 次并发自增应得 20（非 read-modify-write 丢计数）");
 });
 
-test("双审#2: 召回计数不推进结构版本（不触发重建），且绝不掩盖结构写", async () => {
-  const e = await store.store({ text: "structural version target", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
+test("复审#1: 表版本驱动新鲜度——召回计数后再写结构，绝不被掩盖", async () => {
+  const e = await store.store({ text: "version masking target", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
   const kg = new KnowledgeGraphManager(store);
   await kg.build();
-  const sv0 = store.structuralVersion();
-  assert.equal(kg.getBuiltVersion(), sv0, "build 后 builtVersion==结构版本");
-
-  // 召回计数：不推进结构版本 → ensureFresh 不重建
-  await store.incrementRecallBatch([e.id]);
-  assert.equal(store.structuralVersion(), sv0, "召回计数不应推进结构版本");
   const n0 = kg.getStats().totalNodes;
-  await kg.ensureFresh();
-  assert.equal(kg.getBuiltVersion(), sv0, "召回计数后不应重建");
 
-  // 关键：召回计数写之后再来一条结构写，ensureFresh 必须重建并纳入（不被掩盖）
-  await store.store({ text: "structural after recall zzz", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
+  // 关键反掩盖序列：先召回计数写，再来一条结构写，ensureFresh 必须纳入新记忆
+  await store.incrementRecallBatch([e.id]);
+  await store.store({ text: "structural after recall masking zzz", vector: vec(), category: "fact", scope: "test", importance: 0.5 });
   await kg.ensureFresh();
-  assert.equal(kg.getStats().totalNodes, n0 + 1, "结构写绝不能被召回计数掩盖，必须重建纳入");
+  assert.equal(kg.getStats().totalNodes, n0 + 1, "结构写绝不能被召回计数掩盖");
+
+  // 版本未变则幂等不重复重建
+  const after = kg.getStats().totalNodes;
+  await kg.ensureFresh();
+  assert.equal(kg.getStats().totalNodes, after, "版本未变不应再增");
 });
 
 test("P1: delete 删 0 行返回 false（不假报已删除）", async () => {

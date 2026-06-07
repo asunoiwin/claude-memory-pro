@@ -101,59 +101,24 @@ function groupByEntityKey(entries: MemoryEntry[]): EntityGroup[] {
 }
 
 // ============================================================================
-// 简易矛盾检测（基于文本相似度，无需外部 LLM）
+// 简易矛盾检测（无需外部 LLM，仅认最干净的否定矛盾，从严避免误判）
 // ============================================================================
 
-// 字符 2-gram：中文无空格，按空格分词会把整句当一个 token 致相似度恒为0
-function charBigrams(s: string): Set<string> {
-  const t = s.toLowerCase().replace(/\s+/g, '');
-  const grams = new Set<string>();
-  if (t.length === 1) { grams.add(t); return grams; }
-  for (let i = 0; i < t.length - 1; i++) grams.add(t.slice(i, i + 2));
-  return grams;
+// 去掉否定词(不/别/勿/未/无)与空白、转小写，用于"除否定外是否完全相同"的比对
+function stripForCompare(s: string): string {
+  return s.toLowerCase().replace(/\s+/g, '').replace(/[不别勿未无]/g, '');
 }
-
-function jaccard(a: string, b: string): number {
-  const setA = charBigrams(a), setB = charBigrams(b);
-  if (setA.size === 0 || setB.size === 0) return 0;
-  let inter = 0;
-  for (const g of setA) if (setB.has(g)) inter++;
-  const union = setA.size + setB.size - inter;
-  return union > 0 ? inter / union : 0;
+function negatorCount(s: string): number {
+  return (s.match(/[不别勿未无]/g) || []).length;
 }
-
-const NEGATORS = /[不别勿未无]/;
-// word 在 text 中是否以"被否定/被肯定"形式出现（看紧邻前 2 字是否有否定词）
-function occursWith(text: string, word: string, wantNegated: boolean): boolean {
-  let i = text.indexOf(word);
-  while (i >= 0) {
-    const before = text.slice(Math.max(0, i - 2), i);
-    if (NEGATORS.test(before) === wantNegated) return true;
-    i = text.indexOf(word, i + 1);
-  }
-  return false;
-}
-// "只以肯定/只以否定形式出现"——避免同一字既在肯定词又在否定词里（如"能"同时在"功能"和"不能"）造成误判
-const clearlyAsserts = (t: string, w: string) => occursWith(t, w, false) && !occursWith(t, w, true);
-const clearlyNegates = (t: string, w: string) => occursWith(t, w, true) && !occursWith(t, w, false);
 
 export function detectSimpleContradiction(newer: string, older: string): boolean {
-  const similarity = jaccard(newer, older);
-  if (similarity < 0.3) return false;
-
-  // 源 A：同一动作词，一句只否定、另一句只肯定（"不要X"vs"要X"、"不允许"vs"允许"、"别开启"vs"开启"）。
-  const directives = ['要', '用', '能', '开启', '关闭', '允许', '禁止', '添加', '移除', '登录', '启用', '停用'];
-  for (const w of directives) {
-    if ((clearlyNegates(newer, w) && clearlyAsserts(older, w)) ||
-        (clearlyNegates(older, w) && clearlyAsserts(newer, w))) return true;
-  }
-  // 源 B：反义词对各自被"肯定"地出现（被否定的不算，故"不能开启"vs"不能关闭"不触发）。
-  const antonyms: Array<[string, string]> = [['开启', '关闭'], ['允许', '禁止'], ['添加', '移除'], ['启用', '停用'], ['false', 'true']];
-  for (const [a, b] of antonyms) {
-    if ((clearlyAsserts(newer, a) && clearlyAsserts(older, b)) ||
-        (clearlyAsserts(newer, b) && clearlyAsserts(older, a))) return true;
-  }
-  return false;
+  // 只认最干净的"否定矛盾"：去掉否定词后两句完全相同，且否定词数量奇偶不同（即 "X" vs "不X"）。
+  // 天然排除：内容不同(费用≠计用、falsey≠true)、双重否定(奇偶相同视为肯定)。
+  // 反义词类(开启/关闭)与细微矛盾交给 GLM 扫描器——文本启发式误判会错误隐藏记忆，故从严。
+  const a = stripForCompare(newer), b = stripForCompare(older);
+  if (!a || a !== b) return false;
+  return (negatorCount(newer) % 2) !== (negatorCount(older) % 2);
 }
 
 // ============================================================================
