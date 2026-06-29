@@ -12,7 +12,9 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import type { MemoryEntry } from './store.js';
+import type { MemoryEntry, MemoryStore } from './store.js';
+import type { Embedder } from './embedder.js';
+import { cleanupStoredMemories } from './memory-cleaner.js';
 
 // ============================================================================
 // Types & Config
@@ -329,6 +331,7 @@ interface LastRunState {
   light: string | null;
   deep: string | null;
   rem: string | null;
+  maintenance?: string | null;
 }
 
 export function loadLastRunState(): LastRunState {
@@ -337,7 +340,7 @@ export function loadLastRunState(): LastRunState {
       return JSON.parse(readFileSync(LAST_RUN_FILE, 'utf8')) as LastRunState;
     }
   } catch {}
-  return { light: null, deep: null, rem: null };
+  return { light: null, deep: null, rem: null, maintenance: null };
 }
 
 export function saveLastRunState(state: LastRunState): void {
@@ -386,6 +389,61 @@ export async function recoverMissedPhases(
 
   saveLastRunState(state);
   return { recovered };
+}
+
+// ============================================================================
+// Dream 维护：定期清理 + 压缩（治记忆噪音与存储膨胀）
+// ============================================================================
+
+export interface MaintenanceReport {
+  ranAt: string;
+  cleanup?: { scanned: number; deleted: number; cleaned: number; deduped: number };
+  compact?: { ok: boolean; error?: string };
+}
+
+const MAINTENANCE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 默认每日一次
+
+/**
+ * 执行一次 dream 维护：
+ *  - 清理：删噪音 + 去重（复用 memory-cleaner，不重造）
+ *  - 压缩：LanceDB optimize 合并碎片 + 回收旧版本（治"8M 内容撑成上百 M"的索引/版本膨胀）
+ * 压缩排在清理之后：清理产生的删除会留下更多可回收的碎片/旧版本。
+ * cleanup / compact 可分别关闭。
+ */
+export async function runDreamMaintenance(
+  store: MemoryStore,
+  embedder: Embedder,
+  opts: { cleanup?: boolean; compact?: boolean; cleanupLimit?: number } = {}
+): Promise<MaintenanceReport> {
+  const report: MaintenanceReport = { ranAt: new Date().toISOString() };
+  if (opts.cleanup !== false) {
+    try {
+      report.cleanup = await cleanupStoredMemories(store, embedder, { limit: opts.cleanupLimit });
+    } catch (err) {
+      console.error(`[claude-memory-pro] dream 维护-清理失败: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  if (opts.compact !== false) {
+    report.compact = await store.optimize();
+  }
+  return report;
+}
+
+/**
+ * 到期才跑维护（默认每 24h），并更新 last-run 标记。崩溃安全：跑成才记标记。
+ * 返回 null 表示未到期、本次跳过。
+ */
+export async function maybeRunMaintenance(
+  store: MemoryStore,
+  embedder: Embedder,
+  intervalMs = MAINTENANCE_INTERVAL_MS
+): Promise<MaintenanceReport | null> {
+  const state = loadLastRunState();
+  if (!needsRecovery(state.maintenance ?? null, intervalMs)) return null;
+  const report = await runDreamMaintenance(store, embedder);
+  state.maintenance = report.ranAt;
+  saveLastRunState(state);
+  return report;
 }
 
 // ============================================================================

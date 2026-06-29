@@ -32,7 +32,7 @@ import {
   parseMemoryMetadata,
   type MetadataStance,
 } from "./knowledge-graph.js";
-import { promoteMemoriesFromStore, recoverMissedPhases, getDreamStats, readDreamTrail, DEFAULT_CONFIG as DREAM_DEFAULT_CONFIG, type DreamConfig, saveLastRunState, loadLastRunState } from "./dream-manager.js";
+import { promoteMemoriesFromStore, recoverMissedPhases, getDreamStats, readDreamTrail, DEFAULT_CONFIG as DREAM_DEFAULT_CONFIG, type DreamConfig, saveLastRunState, loadLastRunState, runDreamMaintenance, maybeRunMaintenance } from "./dream-manager.js";
 import { runDailyReorganization } from "./memory-daily-reorg.js";
 
 // ============================================================================
@@ -1087,8 +1087,8 @@ server.tool(
   "memory_dream",
   "Dream 记忆晋升系统。三阶段晋升（light/deep/REM），基于召回频率自动提升记忆，写入 dream.md。支持手动触发、查看 trail、日常整理。",
   {
-    action: z.enum(["status", "run", "trail", "recover", "reorg"]).default("status")
-      .describe("status=查看状态，run=执行晋升，trail=查看dream.md，recover=恢复错过的阶段，reorg=日常整理"),
+    action: z.enum(["status", "run", "trail", "recover", "reorg", "maintain"]).default("status")
+      .describe("status=查看状态，run=执行晋升，trail=查看dream.md，recover=恢复错过的阶段，reorg=日常整理，maintain=清理+压缩维护"),
     phase: z.enum(["light", "deep", "rem"]).optional()
       .describe("晋升阶段（action=run时，默认light）"),
   },
@@ -1127,6 +1127,18 @@ server.tool(
         return { content: [{ type: "text" as const, text: "无需恢复，所有阶段均在有效期内。" }] };
       }
       return { content: [{ type: "text" as const, text: `已恢复错过的阶段：${result.recovered.join(', ')}` }] };
+    }
+
+    if (action === "maintain") {
+      const report = await runDreamMaintenance(store, embedder);
+      const lines = ["Dream 维护完成："];
+      if (report.cleanup) {
+        lines.push(`• 清理：扫描 ${report.cleanup.scanned} / 删噪音 ${report.cleanup.deleted} / 去重 ${report.cleanup.deduped} / 压缩文本 ${report.cleanup.cleaned}`);
+      }
+      if (report.compact) {
+        lines.push(`• 压缩：${report.compact.ok ? '成功（已合并碎片、回收旧版本/索引）' : '失败 - ' + (report.compact.error || '未知')}`);
+      }
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     }
 
     if (action === "reorg") {
@@ -1386,6 +1398,16 @@ async function main() {
     console.error(`[claude-memory-pro] Dream recovery failed: ${err}`);
   }
 
+  // Dream 维护：启动时补跑一次到期的清理+压缩（自门控每日一次）
+  try {
+    const m = await maybeRunMaintenance(store, embedder);
+    if (m) {
+      console.error(`[claude-memory-pro] Dream maintenance: cleanup(del=${m.cleanup?.deleted ?? 0},dedup=${m.cleanup?.deduped ?? 0}) compact=${m.compact?.ok ? 'ok' : 'skip/fail'}`);
+    }
+  } catch (err) {
+    console.error(`[claude-memory-pro] Dream maintenance failed: ${err}`);
+  }
+
   // Dream 定时器：运行期间每 30 分钟自动执行 light 晋升
   const DREAM_INTERVAL_MS = 30 * 60 * 1000; // 30 min
   setInterval(async () => {
@@ -1398,11 +1420,16 @@ async function main() {
       const st = loadLastRunState();
       st.light = new Date().toISOString();
       saveLastRunState(st);
+      // 顺带检查维护是否到期（自门控每日一次：清理+压缩）
+      const m = await maybeRunMaintenance(store, embedder);
+      if (m) {
+        console.error(`[claude-memory-pro] Dream maintenance: cleanup(del=${m.cleanup?.deleted ?? 0},dedup=${m.cleanup?.deduped ?? 0}) compact=${m.compact?.ok ? 'ok' : 'skip/fail'}`);
+      }
     } catch (err) {
       console.error(`[claude-memory-pro] Dream auto-promote failed: ${err}`);
     }
   }, DREAM_INTERVAL_MS);
-  console.error(`[claude-memory-pro] Dream timer: light promotion every 30min`);
+  console.error(`[claude-memory-pro] Dream timer: light promotion every 30min + daily maintenance`);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

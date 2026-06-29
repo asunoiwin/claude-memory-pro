@@ -297,6 +297,24 @@ export class MemoryStore {
     try { return await this.table.version(); } catch { return 0; }
   }
 
+  /**
+   * 压缩存储：合并数据碎片 + 重建索引，并回收早于 (now - retainMs) 的旧版本。
+   * 治理"内容仅数 MB 却被索引/版本历史撑到上百 MB"的膨胀。LanceDB 永远保留当前版本，
+   * 清旧版本不丢现存记忆；retainMs 留一点安全窗口，避免并发写入产生的版本被提前回收。
+   */
+  async optimize(retainMs = 2 * 60 * 1000): Promise<{ ok: boolean; error?: string }> {
+    if (!this.table) return { ok: false, error: "Store not initialized" };
+    try {
+      const cleanupOlderThan = new Date(Date.now() - Math.max(0, retainMs));
+      await this.table.optimize({ cleanupOlderThan });
+      return { ok: true };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[claude-memory-pro] optimize 失败: ${msg}`);
+      return { ok: false, error: msg };
+    }
+  }
+
   async count(scopeFilter?: string[]): Promise<number> {
     if (!this.table) return 0;
     if (!scopeFilter || scopeFilter.length === 0) return await this.table.countRows();
