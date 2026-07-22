@@ -168,9 +168,10 @@ export class MemoryRetriever {
     fused.sort((a, b) => b.score - a.score);
     const aboveMin = fused.filter(r => r.score >= this.config.minScore);
 
-    // Rerank with cosine similarity
+    // Rerank with cosine similarity (convert Arrow vectors to plain arrays)
     const reranked = aboveMin.slice(0, limit * 2).map(r => {
-      const cos = cosineSimilarity(queryVector, r.entry.vector);
+      const entryVector = Array.from(r.entry.vector as Iterable<number>);
+      const cos = cosineSimilarity(queryVector, entryVector);
       const combined = r.score * 0.7 + cos * 0.3;
       return {
         ...r,
