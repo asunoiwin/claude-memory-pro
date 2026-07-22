@@ -166,6 +166,28 @@ export class MemoryStore {
     }
   }
 
+  /**
+   * 陈旧句柄自愈：本进程与 codex-memory-pro 共用同一 LanceDB（MEMORY_DB_PATH 相同），
+   * 对方进程 optimize 回收旧版本后，本进程缓存的 table 句柄会指向已删除的数据文件，
+   * 读写报 "Not found: ...lance"。此时重开表句柄重试一次即可恢复。
+   */
+  private isStaleHandleError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return /Not found:.*\.lance|dataset.*(deleted|not found)|version.*(not found|no longer exists)/i.test(msg);
+  }
+
+  private async withLiveTable<T>(fn: (table: LanceDB.Table) => Promise<T>): Promise<T> {
+    if (!this.table) throw new Error("Store not initialized");
+    try {
+      return await fn(this.table);
+    } catch (err) {
+      if (!this.isStaleHandleError(err) || !this.db) throw err;
+      console.error(`[claude-memory-pro] 表句柄陈旧（另一进程已回收旧版本），重开句柄重试`);
+      this.table = await this.db.openTable("memories");
+      return await fn(this.table);
+    }
+  }
+
   async store(entry: Omit<MemoryEntry, "id" | "timestamp">): Promise<MemoryEntry> {
     if (!this.table) throw new Error("Store not initialized");
     validateVector(entry.vector, this.config.vectorDim);
@@ -176,7 +198,7 @@ export class MemoryStore {
       recallCount: 0,
       lastRecallAt: 0,
     };
-    await this.table.add([full as any]);
+    await this.withLiveTable(t => t.add([full as any]));
     return full;
   }
 
@@ -189,14 +211,14 @@ export class MemoryStore {
     if (!this.table) throw new Error("Store not initialized");
     const safeLimit = clampInt(limit, 1, 100);
 
-    let query = this.table.search(queryVector).limit(safeLimit);
-
-    if (scopeFilter && scopeFilter.length > 0) {
-      const scopeConditions = scopeFilter.map(s => `scope = '${escapeSqlLiteral(s)}'`).join(" OR ");
-      query = query.where(`(${scopeConditions})`);
-    }
-
-    const results = await query.toArray();
+    const results = await this.withLiveTable(t => {
+      let query = t.search(queryVector).limit(safeLimit);
+      if (scopeFilter && scopeFilter.length > 0) {
+        const scopeConditions = scopeFilter.map(s => `scope = '${escapeSqlLiteral(s)}'`).join(" OR ");
+        query = query.where(`(${scopeConditions})`);
+      }
+      return query.toArray();
+    });
     return results
       .map((row: any) => ({
         entry: rowToMemoryEntry(row),
@@ -214,14 +236,14 @@ export class MemoryStore {
     const safeLimit = clampInt(limit, 1, 100);
 
     try {
-      let search = this.table.search(query, "text").limit(safeLimit);
-
-      if (scopeFilter && scopeFilter.length > 0) {
-        const scopeConditions = scopeFilter.map(s => `scope = '${escapeSqlLiteral(s)}'`).join(" OR ");
-        search = search.where(`(${scopeConditions})`);
-      }
-
-      const results = await search.toArray();
+      const results = await this.withLiveTable(t => {
+        let search = t.search(query, "text").limit(safeLimit);
+        if (scopeFilter && scopeFilter.length > 0) {
+          const scopeConditions = scopeFilter.map(s => `scope = '${escapeSqlLiteral(s)}'`).join(" OR ");
+          search = search.where(`(${scopeConditions})`);
+        }
+        return search.toArray();
+      });
       return results.map((row: any) => ({
         entry: rowToMemoryEntry(row),
         score: row._score || 0.5,
@@ -234,10 +256,12 @@ export class MemoryStore {
   async getByIds(ids: string[]): Promise<MemoryEntry[]> {
     if (!this.table || ids.length === 0) return [];
     const conditions = ids.map(id => `id = '${escapeSqlLiteral(id)}'`).join(" OR ");
-    const results = await this.table.search(new Array(this.config.vectorDim).fill(0))
-      .where(`(${conditions})`)
-      .limit(ids.length)
-      .toArray();
+    const results = await this.withLiveTable(t =>
+      t.search(new Array(this.config.vectorDim).fill(0))
+        .where(`(${conditions})`)
+        .limit(ids.length)
+        .toArray()
+    );
     return results.map(rowToMemoryEntry);
   }
 
@@ -250,10 +274,12 @@ export class MemoryStore {
         condition += ` AND (${scopeConditions})`;
       }
       // 真删到才算成功：删 0 行（id 不存在 / 域不匹配）返回 false，避免假"已删除"确认
-      const matched = await this.table.countRows(condition);
-      if (matched === 0) return false;
-      await this.table.delete(condition);
-      return true;
+      return await this.withLiveTable(async t => {
+        const matched = await t.countRows(condition);
+        if (matched === 0) return false;
+        await t.delete(condition);
+        return true;
+      });
     } catch {
       return false;
     }
@@ -283,7 +309,9 @@ export class MemoryStore {
     };
 
     // 原子 upsert（按 id 合并）：避免"先删后加"中途失败丢记忆 / 并发回滚
-    await this.table.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute([updated as any]);
+    await this.withLiveTable(t =>
+      t.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute([updated as any])
+    );
     return updated;
   }
 
@@ -306,7 +334,7 @@ export class MemoryStore {
     if (!this.table) return { ok: false, error: "Store not initialized" };
     try {
       const cleanupOlderThan = new Date(Date.now() - Math.max(0, retainMs));
-      await this.table.optimize({ cleanupOlderThan });
+      await this.withLiveTable(t => t.optimize({ cleanupOlderThan }));
       return { ok: true };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -317,9 +345,9 @@ export class MemoryStore {
 
   async count(scopeFilter?: string[]): Promise<number> {
     if (!this.table) return 0;
-    if (!scopeFilter || scopeFilter.length === 0) return await this.table.countRows();
+    if (!scopeFilter || scopeFilter.length === 0) return await this.withLiveTable(t => t.countRows());
     const scopeConditions = scopeFilter.map(s => `scope = '${escapeSqlLiteral(s)}'`).join(" OR ");
-    return await this.table.countRows(`(${scopeConditions})`);
+    return await this.withLiveTable(t => t.countRows(`(${scopeConditions})`));
   }
 
   async scan(
@@ -331,13 +359,14 @@ export class MemoryStore {
     const safeLimit = clampInt(limit, 1, 5000);
     const safeOffset = clampInt(offset, 0, Number.MAX_SAFE_INTEGER);
 
-    let query = this.table.query().limit(safeLimit).offset(safeOffset);
-    if (scopeFilter && scopeFilter.length > 0) {
-      const scopeConditions = scopeFilter.map(s => `scope = '${escapeSqlLiteral(s)}'`).join(" OR ");
-      query = query.where(`(${scopeConditions})`);
-    }
-
-    const results = await query.toArray();
+    const results = await this.withLiveTable(t => {
+      let query = t.query().limit(safeLimit).offset(safeOffset);
+      if (scopeFilter && scopeFilter.length > 0) {
+        const scopeConditions = scopeFilter.map(s => `scope = '${escapeSqlLiteral(s)}'`).join(" OR ");
+        query = query.where(`(${scopeConditions})`);
+      }
+      return query.toArray();
+    });
     return results.map(rowToMemoryEntry);
   }
 
@@ -347,10 +376,10 @@ export class MemoryStore {
     const inList = ids.map(id => `'${escapeSqlLiteral(id)}'`).join(", ");
     try {
       // DB 端原子自增（valuesSql 在引擎内对每行算 recallCount+1），避免 read-modify-write 并发丢计数
-      await this.table.update({
+      await this.withLiveTable(t => t.update({
         where: `id IN (${inList})`,
         valuesSql: { recallCount: "coalesce(recallCount, 0) + 1", lastRecallAt: String(now) },
-      });
+      }));
     } catch (err) {
       console.error(`[claude-memory-pro] incrementRecallBatch 失败: ${err instanceof Error ? err.message : err}`);
     }
